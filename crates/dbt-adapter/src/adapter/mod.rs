@@ -1829,7 +1829,7 @@ impl Adapter {
     #[tracing::instrument(skip_all, level = "trace")]
     pub fn behavior(&self) -> Value {
         match &self.inner {
-            Typed { adapter, .. } => Value::from_object((**adapter.beh
+            Typed { adapter, .. } => Value::from_object((**adapter.behavior_object()).clone()),
             Parse(_) => Value::from_object(Behavior::new(vec![], &BTreeMap::new())),
         }
     }
