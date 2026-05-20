@@ -1829,7 +1829,7 @@ impl Adapter {
     #[tracing::instrument(skip_all, level = "trace")]
     pub fn behavior(&self) -> Value {
         match &self.inner {
-            Typed { adapter, .. } => Value::from_object((**adapter.behavior_object()).clone()),
+            Typed { adapter, .. } => Value::from_object((**adapter.beh
             Parse(_) => Value::from_object(Behavior::new(vec![], &BTreeMap::new())),
         }
     }
@@ -4132,3 +4132,4 @@ fn debug_compare_column_types(
         }
     }
 }
+pub mod bigquery_reservation;

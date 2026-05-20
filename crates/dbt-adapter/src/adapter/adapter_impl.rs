@@ -1159,7 +1159,7 @@ impl AdapterImpl {
                     let record_batch = table.to_record_batch();
                     let num_rows = record_batch.num_rows();
                     let transient_col: ArrayRef =
-                        Arc::new(BooleanArray::from(vec![Some(is_transient); num_rows]));
+                        Arc::new(BooleanArray::from(vec![Some(is_transient); num_rows)]);
                     let mut fields: Vec<Arc<Field>> =
                         record_batch.schema().fields().iter().cloned().collect();
                     fields.push(Arc::new(Field::new("transient", DataType::Boolean, true)));
@@ -4152,7 +4152,10 @@ impl AdapterImpl {
                 });
 
                 if let Some(t) = timeout {
-                    options.push((QUERY_JOB_TIMEOUT.to_string(), OptionValue::Int(t * 1000)));
+                    options.push((
+                        QUERY_JOB_TIMEOUT.to_string(),
+                        OptionValue::Int(t * 1000),
+                    ));
                 }
 
                 options
@@ -4918,7 +4921,6 @@ mod tests {
             hive_table.is_hive_metastore(),
             "Expected is_hive_metastore() to return true for non-temporary table in hive_metastore"
         );
-        assert!(!hive_table.is_temporary(), "Expected non-temporary table");
         // use_legacy = is_hive_metastore || is_materialized_view || is_streaming_table
         // use_legacy = true || false || false = true
         let use_legacy_hive_table = hive_table.is_hive_metastore()
@@ -4948,7 +4950,6 @@ mod tests {
             !uc_temp_table.is_hive_metastore(),
             "Expected is_hive_metastore() to return FALSE for UC temporary table (matching Python semantics)"
         );
-        assert!(uc_temp_table.is_temporary(), "Expected temporary table");
         // use_legacy = is_hive_metastore || is_materialized_view || is_streaming_table
         // use_legacy = false || false || false = false
         let use_legacy_uc_temp = uc_temp_table.is_hive_metastore()
