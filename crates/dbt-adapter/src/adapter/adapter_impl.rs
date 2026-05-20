@@ -4152,7 +4152,7 @@ impl AdapterImpl {
                 });
 
                 if let Some(t) = timeout {
-                    options.push((QUERY_JOB_TIMEOUT.to_string(),OptionValue::Int(t * 1000)));
+                    options.push((QUERY_JOB_TIMEOUT.to_string(), OptionValue::Int(t * 1000)));
                 }
 
                 options
