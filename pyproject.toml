@@ -2,6 +2,7 @@
 
 [project]
 name = "dbt-sa-cli"
+dynamic = ["version"]
 description = "dbt Fusion standalone analyzer CLI"
 authors = [{ name = "dbt Labs", email = "info@dbtlabs.com" }]
 readme = "README.md"
