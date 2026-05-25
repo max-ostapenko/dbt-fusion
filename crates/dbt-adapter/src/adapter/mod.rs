@@ -4132,4 +4132,3 @@ fn debug_compare_column_types(
         }
     }
 }
-pub mod bigquery_reservation;
