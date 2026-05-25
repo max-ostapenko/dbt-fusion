@@ -144,6 +144,12 @@ pub struct ProjectSnapshotConfig {
         deserialize_with = "bool_or_string_bool"
     )]
     pub copy_grants: Option<bool>,
+    #[serde(
+        default,
+        rename = "+copy_tags",
+        deserialize_with = "bool_or_string_bool"
+    )]
+    pub copy_tags: Option<bool>,
     #[serde(rename = "+external_volume")]
     pub external_volume: Option<String>,
     #[serde(rename = "+initialize")]
@@ -501,6 +507,24 @@ impl SnapshotMetaColumnNames {
                 .to_lowercase()
         }
     }
+
+    pub fn to_defaulted_column_names(&self) -> YmlValue {
+        fn insert_name(map: &mut dbt_yaml::Mapping, key: &str, value: &Option<String>) {
+            let column_name = match value {
+                Some(value) => value.as_str(),
+                None => key,
+            };
+            map.insert(key.into(), YmlValue::string(column_name.to_string()));
+        }
+
+        let mut names = dbt_yaml::Mapping::new();
+        insert_name(&mut names, "dbt_scd_id", &self.dbt_scd_id);
+        insert_name(&mut names, "dbt_updated_at", &self.dbt_updated_at);
+        insert_name(&mut names, "dbt_valid_from", &self.dbt_valid_from);
+        insert_name(&mut names, "dbt_valid_to", &self.dbt_valid_to);
+        insert_name(&mut names, "dbt_is_deleted", &self.dbt_is_deleted);
+        YmlValue::mapping(names)
+    }
 }
 
 impl From<ProjectSnapshotConfig> for SnapshotConfig {
@@ -560,6 +584,7 @@ impl From<ProjectSnapshotConfig> for SnapshotConfig {
                 row_access_policy: config.row_access_policy,
                 automatic_clustering: config.automatic_clustering,
                 copy_grants: config.copy_grants,
+                copy_tags: config.copy_tags,
                 secure: config.secure,
                 transient: config.transient,
                 iceberg_version: None,
@@ -686,6 +711,7 @@ impl From<SnapshotConfig> for ProjectSnapshotConfig {
             row_access_policy: config.__warehouse_specific_config__.row_access_policy,
             automatic_clustering: config.__warehouse_specific_config__.automatic_clustering,
             copy_grants: config.__warehouse_specific_config__.copy_grants,
+            copy_tags: config.__warehouse_specific_config__.copy_tags,
             secure: config.__warehouse_specific_config__.secure,
             // BigQuery fields
             partition_by: config.__warehouse_specific_config__.partition_by,

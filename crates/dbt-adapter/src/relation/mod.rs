@@ -50,14 +50,19 @@ mod tests {
 
     #[test]
     fn test_render_with_run_filter_snowflake_adapter() {
-        let relation = snowflake::SnowflakeRelation::new(
+        let mut relation = Relation::new(
+            AdapterType::Snowflake,
             None,
             None,
             Some("my_table".to_owned()),
             None,
-            TableFormat::Default,
+            None,
             ResolvedQuoting::disabled(),
+            None,
+            false,
+            false,
         );
+        relation.table_format = TableFormat::Default;
         let start = NaiveDate::from_ymd_opt(2024, 7, 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
@@ -81,7 +86,55 @@ mod tests {
         let result = relation.render_with_run_filter(&run_filter, &event_time);
         assert_eq!(
             result,
-            "(select * from my_table where created_at >= to_timestamp_tz('2024-07-01T00:00:00') and created_at < to_timestamp_tz('2024-07-08T18:00:00'))"
+            "(select * from my_table where created_at >= to_timestamp_tz('2024-07-01T00:00:00+00:00') and created_at < to_timestamp_tz('2024-07-08T18:00:00+00:00'))"
+        );
+    }
+
+    // Regression for dbt-labs/dbt-fusion#1608: the source-side event-time
+    // predicate on Snowflake must emit the explicit `+00:00` UTC offset so it
+    // resolves consistently with the microbatch DELETE predicate in non-UTC
+    // Snowflake sessions. Uses a non-midnight hour to mirror the reporter's
+    // hourly batch window.
+    #[test]
+    fn test_render_with_run_filter_snowflake_microbatch_includes_utc_offset() {
+        let relation = Relation::new(
+            AdapterType::Snowflake,
+            None,
+            None,
+            Some("stg_events".to_owned()),
+            None,
+            None,
+            ResolvedQuoting::disabled(),
+            None,
+            false,
+            false,
+        );
+        let start = NaiveDate::from_ymd_opt(2026, 4, 27)
+            .unwrap()
+            .and_hms_opt(16, 0, 0)
+            .unwrap();
+        let end = NaiveDate::from_ymd_opt(2026, 4, 27)
+            .unwrap()
+            .and_hms_opt(17, 0, 0)
+            .unwrap();
+
+        let run_filter = RunFilter {
+            empty: false,
+            sample: Some(Sample {
+                start: Some(DateTime::<Utc>::from_naive_utc_and_offset(start, Utc)),
+                end: Some(DateTime::<Utc>::from_naive_utc_and_offset(end, Utc)),
+            }),
+        };
+        let event_time = Some("event_at".to_string());
+
+        let result = relation.render_with_run_filter(&run_filter, &event_time);
+        assert!(
+            result.contains("to_timestamp_tz('2026-04-27T16:00:00+00:00')"),
+            "expected source-side start predicate to carry +00:00, got: {result}"
+        );
+        assert!(
+            result.contains("to_timestamp_tz('2026-04-27T17:00:00+00:00')"),
+            "expected source-side end predicate to carry +00:00, got: {result}"
         );
     }
 
@@ -122,7 +175,7 @@ mod tests {
         let result = relation.render_with_run_filter(&run_filter, &event_time);
         assert_eq!(
             result,
-            "(select * from my_table where cast(created_at as timestamp) >= '2024-07-01T00:00:00' and cast(created_at as timestamp) < '2024-07-08T18:00:00')"
+            "(select * from my_table where cast(created_at as timestamp) >= '2024-07-01T00:00:00+00:00' and cast(created_at as timestamp) < '2024-07-08T18:00:00+00:00')"
         );
     }
 
@@ -164,7 +217,7 @@ mod tests {
         let result = relation.render_with_run_filter(&run_filter, &event_time);
         assert_eq!(
             result,
-            "(select * from my_table where created_at >= '2024-07-01T00:00:00' and created_at < '2024-07-08T18:00:00')"
+            "(select * from my_table where created_at >= '2024-07-01T00:00:00+00:00' and created_at < '2024-07-08T18:00:00+00:00')"
         );
     }
 
@@ -206,7 +259,7 @@ mod tests {
         let result = relation.render_with_run_filter(&run_filter, &event_time);
         assert_eq!(
             result,
-            "(select * from my_table where created_at >= '2024-07-01T00:00:00' and created_at < '2024-07-08T18:00:00')"
+            "(select * from my_table where created_at >= '2024-07-01T00:00:00+00:00' and created_at < '2024-07-08T18:00:00+00:00')"
         );
     }
 
@@ -243,6 +296,47 @@ mod tests {
         assert_eq!(
             relation.render_self_as_str(),
             "\"stocks_dev\".\"main\".\"files\""
+        );
+    }
+
+    #[test]
+    fn test_render_with_run_filter_clickhouse_adapter() {
+        let relation = Relation::new(
+            AdapterType::ClickHouse,
+            None,
+            Some("analytics".to_string()),
+            Some("events".to_owned()),
+            None,
+            None,
+            ResolvedQuoting::disabled(),
+            None,
+            false,
+            false,
+        );
+        let start = NaiveDate::from_ymd_opt(2024, 7, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let end = NaiveDate::from_ymd_opt(2024, 7, 8)
+            .unwrap()
+            .and_hms_opt(18, 0, 0)
+            .unwrap();
+
+        let sample = Sample {
+            start: Some(DateTime::<Utc>::from_naive_utc_and_offset(start, Utc)),
+            end: Some(DateTime::<Utc>::from_naive_utc_and_offset(end, Utc)),
+        };
+
+        let run_filter = RunFilter {
+            empty: false,
+            sample: Some(sample),
+        };
+        let event_time = Some("created_at".to_string());
+
+        let result = relation.render_with_run_filter(&run_filter, &event_time);
+        assert_eq!(
+            result,
+            "(select * from analytics.events where created_at >= parseDateTime64BestEffort('2024-07-01T00:00:00+00:00', 9) and created_at < parseDateTime64BestEffort('2024-07-08T18:00:00+00:00', 9))"
         );
     }
 }

@@ -1,8 +1,6 @@
 use std::fmt::Write as _;
 
-use arrow_array::{
-    Array, BooleanArray, Float64Array, Int64Array, ListArray, RecordBatch, StringArray,
-};
+use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
@@ -11,11 +9,13 @@ use serde::{Deserialize, Serialize};
 use axum::extract::Path;
 
 use crate::handlers::json::{bad_request, internal_error, not_found};
+use crate::handlers::node_base::{
+    EdgeRef, ExecutionInfo, bool_col, extract_edge_refs, extract_execution_info, extract_str_list,
+    str_col,
+};
+use crate::handlers::pagination::{Cursor, PageInfo, SortDir, clamp_first, cursor_where_fragment};
 use crate::handlers::sql::escape_str;
 use crate::state::SharedState;
-
-const DEFAULT_LIMIT: u32 = 1000;
-const HARD_MAX_LIMIT: u32 = 5000;
 
 /// Per-layer SQL conditions: `(layer_name, OR'd LIKE clause)`.
 ///
@@ -68,14 +68,19 @@ SELECT DISTINCT name AS owner \
 FROM dbt.groups \
 ORDER BY owner";
 
-/// Allowlisted sort columns: `(query param value, SQL expression)`.
+/// Allowlisted sort columns. Each maps a query-parameter name to the SQL
+/// expression used in **both** `ORDER BY` and the cursor `WHERE` predicate.
+///
+/// Standard SQL prohibits SELECT-alias references in `WHERE`, so we use the
+/// underlying expression for both. `modeling_layer` is a CASE expression and is
+/// resolved dynamically via `resolve_sort_expr` rather than stored as a static
+/// string here.
 const SORTABLE_COLUMNS: &[(&str, &str)] = &[
     ("name", "n.name"),
-    ("modeling_layer", "modeling_layer"),
     ("access_level", "n.access_level"),
     ("contract_enforced", "n.contract_enforced"),
-    ("owner", "owner"),
-    ("executed_at", "executed_at"),
+    ("owner", "n.group_name"),
+    ("executed_at", "CAST(lr.executed_at AS VARCHAR)"),
 ];
 
 const VALID_ACCESS_LEVELS: &[&str] = &["private", "protected", "public"];
@@ -103,12 +108,13 @@ pub struct ModelSummary {
 }
 
 /// Response body for `GET /api/v1/models`.
+///
+/// Cursor-paginated per ADR-6. `page_info` contains the total row count and
+/// the start/end cursors for navigating to adjacent pages.
 #[derive(Serialize)]
 pub struct ModelListResponse {
-    pub models: Vec<ModelSummary>,
-    pub total: u64,
-    pub offset: u32,
-    pub limit: u32,
+    pub data: Vec<ModelSummary>,
+    pub page_info: PageInfo,
 }
 
 /// A single facet option with an optional model count.
@@ -140,27 +146,6 @@ pub struct ModelFacetsResponse {
     pub accesses: Vec<FacetValue>,
     /// Owner (group) options; project-specific, sourced from `dbt.groups`.
     pub owners: Vec<FacetValue>,
-}
-
-/// Extract a `StringArray` column from a batch by name.
-/// Panics on schema mismatch — indicates a bug in the SQL/struct alignment.
-fn str_col<'a>(batch: &'a RecordBatch, name: &'static str) -> &'a StringArray {
-    batch
-        .column_by_name(name)
-        .unwrap_or_else(|| panic!("column '{name}' missing from batch"))
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap_or_else(|| panic!("column '{name}' is not a StringArray"))
-}
-
-/// Extract a `BooleanArray` column from a batch by name.
-fn bool_col<'a>(batch: &'a RecordBatch, name: &'static str) -> &'a BooleanArray {
-    batch
-        .column_by_name(name)
-        .unwrap_or_else(|| panic!("column '{name}' missing from batch"))
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .unwrap_or_else(|| panic!("column '{name}' is not a BooleanArray"))
 }
 
 /// Extract the `owner` string column from the facets query result.
@@ -240,28 +225,55 @@ pub struct ModelListParams {
     /// Column must be one of: name, modeling_layer, access_level,
     /// contract_enforced, owner, executed_at. Default: `name:asc`.
     pub sort: Option<String>,
-    pub limit: Option<u32>,
-    pub offset: Option<u32>,
+    /// Page size — cap on the number of rows returned. Server clamps to
+    /// `[1, MAX_PAGE_SIZE]`. Default `DEFAULT_PAGE_SIZE`.
+    pub first: Option<u32>,
+    /// Opaque cursor from the previous page's `page_info.end_cursor`.
+    pub after: Option<String>,
 }
 
-/// Parse `"field:dir"` into a validated `(sql_expr, direction)` pair.
-/// Returns `Err(&'static str)` so callers can keep the Err variant small.
-fn parse_sort(s: &str) -> Result<(String, &'static str), &'static str> {
+/// Sortable column name and the SQL expression used for ORDER BY and the
+/// cursor WHERE predicate.
+struct SortSelection {
+    /// Query-param column name (e.g. `"name"`, `"executed_at"`).
+    column: String,
+    /// SQL expression — usable in both `ORDER BY` and `WHERE`.
+    sql_expr: String,
+    /// Direction.
+    dir: SortDir,
+}
+
+/// Resolve a query-param sort column to the SQL expression usable in both
+/// `ORDER BY` and the cursor `WHERE` predicate. `modeling_layer` is dynamic
+/// (built from `LAYER_CONDITIONS`); the others are static in `SORTABLE_COLUMNS`.
+fn resolve_sort_expr(col: &str) -> Result<String, &'static str> {
+    if col == "modeling_layer" {
+        return Ok(modeling_layer_case_sql());
+    }
+    SORTABLE_COLUMNS
+        .iter()
+        .find(|(k, _)| *k == col)
+        .map(|(_, expr)| (*expr).to_string())
+        .ok_or("invalid sort column")
+}
+
+/// Parse `"field:dir"` into a validated `SortSelection`.
+fn parse_sort(s: &str) -> Result<SortSelection, &'static str> {
     let (col, dir) = match s.split_once(':') {
         Some((c, d)) => (c, d),
         None => (s, "asc"),
     };
-    let sql_expr = SORTABLE_COLUMNS
-        .iter()
-        .find(|(k, _)| *k == col)
-        .map(|(_, expr)| (*expr).to_string())
-        .ok_or("invalid sort column")?;
+    let sql_expr = resolve_sort_expr(col)?;
     let dir = match dir.to_ascii_lowercase().as_str() {
-        "asc" => "ASC",
-        "desc" => "DESC",
+        "asc" => SortDir::Asc,
+        "desc" => SortDir::Desc,
         _ => return Err("sort direction must be asc or desc"),
     };
-    Ok((sql_expr, dir))
+    Ok(SortSelection {
+        column: col.to_owned(),
+        sql_expr,
+        dir,
+    })
 }
 
 /// Validate a comma-separated list of modeling layer values and return them.
@@ -312,19 +324,22 @@ fn modeling_layer_where(layers: &[&str]) -> String {
         .join(" OR ")
 }
 
-/// Build and return `(count_sql, rows_sql)` for the models list query.
+/// Build and return `(count_sql, rows_sql, sort)` for the models list query.
 ///
 /// `with_run_results` controls whether the `last_run` CTE referencing
 /// `dbt_rt.run_results` is included. Pass `false` when that view is absent.
 ///
-/// Returns `Err(&'static str)` so the Err variant stays small; callers
-/// convert to a `Response` via [`bad_request`].
+/// `cursor` is the decoded `?after` cursor, if any. When present, the rows
+/// query carries a cursor predicate (see [`cursor_where_fragment`]). The
+/// `first + 1` peek is appended to detect `has_next_page` at handler time.
+///
+/// Returns `Err(&'static str)` so the Err variant stays small.
 fn build_list_sql(
     params: &ModelListParams,
     with_run_results: bool,
-    limit: u32,
-    offset: u32,
-) -> Result<(String, String), &'static str> {
+    first: u32,
+    cursor: Option<&Cursor>,
+) -> Result<(String, String, SortSelection), &'static str> {
     // --- validate / parse params ---
     let layers: Vec<&str> = match params.modeling_layer.as_deref().filter(|s| !s.is_empty()) {
         Some(raw) => parse_modeling_layers(raw)?,
@@ -334,9 +349,13 @@ fn build_list_sql(
         Some(raw) => parse_access_levels(raw)?,
         None => vec![],
     };
-    let (order_expr, order_dir) = match params.sort.as_deref().filter(|s| !s.is_empty()) {
+    let sort = match params.sort.as_deref().filter(|s| !s.is_empty()) {
         Some(s) => parse_sort(s)?,
-        None => ("n.name".to_string(), "ASC"),
+        None => SortSelection {
+            column: "name".into(),
+            sql_expr: "n.name".into(),
+            dir: SortDir::Asc,
+        },
     };
 
     // --- WHERE clause ---
@@ -356,6 +375,16 @@ fn build_list_sql(
     if let Some(owner) = params.owner.as_deref().filter(|s| !s.is_empty()) {
         let escaped = escape_str(owner);
         let _ = write!(where_clause, " AND n.group_name = '{escaped}'");
+    }
+    if let Some(c) = cursor {
+        let frag = cursor_where_fragment(
+            &sort.sql_expr,
+            "n.unique_id",
+            sort.dir,
+            c.sort_value.as_deref(),
+            &c.unique_id,
+        );
+        let _ = write!(where_clause, " AND {frag}");
     }
 
     // --- CTE + executed_at column ---
@@ -378,6 +407,9 @@ fn build_list_sql(
          {where_clause}"
     );
     let ml_case = modeling_layer_case_sql();
+    let peek = first + 1;
+    let order_expr = &sort.sql_expr;
+    let order_dir = sort.dir.as_sql();
     let rows_sql = format!(
         "{cte}SELECT \
            n.unique_id, n.name, n.package_name, n.original_file_path, \
@@ -388,22 +420,46 @@ fn build_list_sql(
          FROM dbt.nodes n \
          {lr_join} \
          {where_clause} \
-         ORDER BY {order_expr} {order_dir} NULLS LAST \
-         LIMIT {limit} OFFSET {offset}"
+         ORDER BY {order_expr} {order_dir} NULLS LAST, n.unique_id ASC \
+         LIMIT {peek}"
     );
 
-    Ok((count_sql, rows_sql))
+    Ok((count_sql, rows_sql, sort))
 }
 
-/// `GET /api/v1/models` — paginated, filterable, sortable list of model nodes.
+/// Look up the sort-column value on a [`ModelSummary`] for use in a cursor.
+/// The sort column drives which row field becomes the cursor's `sort_value`.
+fn cursor_sort_value(row: &ModelSummary, column: &str) -> Option<String> {
+    match column {
+        "name" => Some(row.name.clone()),
+        "modeling_layer" => row.modeling_layer.clone(),
+        "access_level" => row.access_level.clone(),
+        "contract_enforced" => Some(
+            if row.contract_enforced {
+                "true"
+            } else {
+                "false"
+            }
+            .to_owned(),
+        ),
+        "owner" => row.owner.clone(),
+        "executed_at" => row.executed_at.clone(),
+        _ => None,
+    }
+}
+
+/// `GET /api/v1/models` — cursor-paginated, filterable, sortable list of model nodes.
 ///
-/// Response shape:
+/// Response shape (ADR-6 envelope):
 /// ```json
 /// {
-///   "models": [...],
-///   "total": 42,
-///   "offset": 0,
-///   "limit": 100
+///   "data": [...],
+///   "page_info": {
+///     "total_count": 42,
+///     "start_cursor": "...",
+///     "end_cursor": "...",
+///     "has_next_page": true
+///   }
 /// }
 /// ```
 ///
@@ -414,20 +470,26 @@ pub async fn list_models(
     State(state): State<SharedState>,
     Query(params): Query<ModelListParams>,
 ) -> Response {
-    let limit = params
-        .limit
-        .unwrap_or(DEFAULT_LIMIT)
-        .clamp(1, HARD_MAX_LIMIT);
-    let offset = params.offset.unwrap_or(0);
+    let first = clamp_first(params.first);
 
-    let (count_sql, rows_sql) = match build_list_sql(&params, true, limit, offset) {
-        Ok(pair) => pair,
+    // Decode the optional ?after cursor up front so a tampered cursor returns
+    // a 400 before we touch the backend.
+    let cursor = match params.after.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => match Cursor::decode(s) {
+            Ok(c) => Some(c),
+            Err(msg) => return bad_request(msg),
+        },
+        None => None,
+    };
+
+    let (count_sql, rows_sql, sort) = match build_list_sql(&params, true, first, cursor.as_ref()) {
+        Ok(triple) => triple,
         Err(msg) => return bad_request(msg),
     };
     // build_list_sql only varies on `with_run_results`; since params already
     // validated above, this second call cannot fail.
-    let (count_sql_no_rr, rows_sql_no_rr) =
-        build_list_sql(&params, false, limit, offset).expect("params already validated");
+    let (count_sql_no_rr, rows_sql_no_rr, _) =
+        build_list_sql(&params, false, first, cursor.as_ref()).expect("params already validated");
 
     let backend = state.providers.backend.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<_, String> {
@@ -459,19 +521,49 @@ pub async fn list_models(
     })
     .await;
 
-    let (total, batches) = match result {
+    let (total_count, batches) = match result {
         Ok(Ok(t)) => t,
         Ok(Err(err)) => return internal_error(err),
         Err(err) => return internal_error(err.to_string()),
     };
 
-    let models = batches_to_model_rows(&batches);
+    let mut rows = batches_to_model_rows(&batches);
+
+    // Peek-detect: we queried `first + 1` rows. If we got that many, there is
+    // at least one more row past this page.
+    let has_next_page = rows.len() as u32 > first;
+    if has_next_page {
+        rows.truncate(first as usize);
+    }
+
+    let start_cursor = rows.first().map(|row| {
+        Cursor {
+            sort_value: cursor_sort_value(row, &sort.column),
+            unique_id: row.unique_id.clone(),
+        }
+        .encode()
+    });
+    let end_cursor = if has_next_page {
+        rows.last().map(|row| {
+            Cursor {
+                sort_value: cursor_sort_value(row, &sort.column),
+                unique_id: row.unique_id.clone(),
+            }
+            .encode()
+        })
+    } else {
+        // No more pages: end_cursor is null per ADR-6.
+        None
+    };
 
     Json(ModelListResponse {
-        models,
-        total,
-        offset,
-        limit,
+        data: rows,
+        page_info: PageInfo {
+            total_count,
+            start_cursor,
+            end_cursor,
+            has_next_page,
+        },
     })
     .into_response()
 }
@@ -542,8 +634,8 @@ pub struct ModelDetail {
     pub tags: Vec<String>,
     pub fqn: Vec<String>,
     pub columns: Vec<ModelColumn>,
-    pub depends_on: Vec<ModelEdgeRef>,
-    pub referenced_by: Vec<ModelEdgeRef>,
+    pub depends_on: Vec<EdgeRef>,
+    pub referenced_by: Vec<EdgeRef>,
     pub execution_info: Option<ExecutionInfo>,
     pub catalog: Option<ModelCatalogInfo>,
 }
@@ -562,19 +654,6 @@ pub struct ModelColumn {
 }
 
 #[derive(Serialize)]
-pub struct ModelEdgeRef {
-    pub unique_id: String,
-    pub edge_type: String,
-}
-
-#[derive(Serialize)]
-pub struct ExecutionInfo {
-    pub status: Option<String>,
-    pub execution_time: Option<f64>,
-    pub completed_at: Option<String>,
-}
-
-#[derive(Serialize)]
 pub struct ModelCatalogInfo {
     // TODO: bytes_stat and row_count_stat live in dbt.catalog_stats keyed by
     // adapter-specific stat_id values. Stub NULL until a populated catalog
@@ -590,27 +669,8 @@ pub struct ModelCatalogInfo {
 // Extraction helpers
 // ---------------------------------------------------------------------------
 
-fn extract_str_list(batch: &RecordBatch, col_name: &'static str) -> Vec<String> {
-    let Some(col) = batch.column_by_name(col_name) else {
-        return vec![];
-    };
-    if batch.num_rows() == 0 || col.is_null(0) {
-        return vec![];
-    }
-    let Some(list) = col.as_any().downcast_ref::<ListArray>() else {
-        return vec![];
-    };
-    let inner = list.value(0);
-    let Some(strings) = inner.as_any().downcast_ref::<StringArray>() else {
-        return vec![];
-    };
-    (0..strings.len())
-        .filter(|&i| !strings.is_null(i))
-        .map(|i| strings.value(i).to_owned())
-        .collect()
-}
-
 fn extract_node_detail(batches: &[RecordBatch]) -> Option<ModelDetail> {
+    use arrow_array::BooleanArray;
     let batch = batches.iter().find(|b| b.num_rows() > 0)?;
 
     let str_opt = |name: &'static str| -> Option<String> {
@@ -705,55 +765,6 @@ fn extract_model_columns(batches: &[RecordBatch]) -> Vec<ModelColumn> {
         }
     }
     rows
-}
-
-fn extract_edge_refs(batches: &[RecordBatch]) -> Vec<ModelEdgeRef> {
-    let mut rows = Vec::new();
-    for batch in batches {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let uid = str_col(batch, "unique_id");
-        let etype = str_col(batch, "edge_type");
-        for i in 0..batch.num_rows() {
-            rows.push(ModelEdgeRef {
-                unique_id: uid.value(i).to_owned(),
-                edge_type: etype.value(i).to_owned(),
-            });
-        }
-    }
-    rows
-}
-
-fn extract_execution_info(batches: &[RecordBatch]) -> Option<ExecutionInfo> {
-    let batch = batches.iter().find(|b| b.num_rows() > 0)?;
-    let status_col = batch
-        .column_by_name("status")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-    let exec_time_col = batch
-        .column_by_name("execution_time")
-        .and_then(|c| c.as_any().downcast_ref::<Float64Array>());
-    let completed_at_col = batch
-        .column_by_name("completed_at")
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
-    Some(ExecutionInfo {
-        status: status_col.and_then(|c| {
-            if c.is_null(0) {
-                None
-            } else {
-                Some(c.value(0).to_owned())
-            }
-        }),
-        execution_time: exec_time_col
-            .and_then(|c| if c.is_null(0) { None } else { Some(c.value(0)) }),
-        completed_at: completed_at_col.and_then(|c| {
-            if c.is_null(0) {
-                None
-            } else {
-                Some(c.value(0).to_owned())
-            }
-        }),
-    })
 }
 
 fn extract_catalog_info(batches: &[RecordBatch]) -> Option<ModelCatalogInfo> {

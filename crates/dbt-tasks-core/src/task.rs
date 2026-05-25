@@ -1,15 +1,19 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use dbt_adapter::connection::ConnectionBackpressure;
+use dbt_adapter::connection::{ConnectionBackpressure, ThreadLocalConnectionRecycleGuard};
 use dbt_adapter_core::AdapterType;
 use dbt_common::stats::NodeStatus;
 use dbt_common::{ErrorCode, FsResult, fs_err};
-use dbt_schemas::schemas::InternalDbtNodeAttributes;
+use dbt_dag::schedule::Schedule;
+use dbt_schemas::schemas::profiles::Execute;
+use dbt_schemas::schemas::properties::UnitTestOverrides;
 use dbt_schemas::schemas::telemetry::{ExecutionPhase, NodeType};
+use dbt_schemas::schemas::{InternalDbtNodeAttributes, Nodes};
 
 use crate::context::TaskRunnerCtx;
 use crate::span_manager::{SpanLevel, SpanTreeRequest};
@@ -17,6 +21,7 @@ use crate::task_spans::{
     node_processed_span_key, phase_span_key, task_span_on_close, task_span_on_skip,
     update_node_outcome_from_skip_reason,
 };
+use crate::test_aggregation::GenericTestAggregation;
 use crate::visitor::SkipReason;
 
 /// Stands for Task Phase
@@ -94,26 +99,19 @@ impl<T: Send + 'static> TaskOp<T> {
     /// Execute this operation on the appropriate thread pool.
     pub async fn run(self) -> FsResult<T> {
         match self {
-            TaskOp::Blocking(f) => {
-                let span = tracing::Span::current();
-                tokio::task::spawn_blocking(move || {
-                    let _sp = span.enter();
-                    f()
-                })
+            TaskOp::Blocking(f) => dbt_common::tracing::spawn_blocking_traced(f)
                 .await
-                .map_err(|e| fs_err!(ErrorCode::Generic, "spawn_blocking join error: {}", e))
-            }
+                .map_err(|e| fs_err!(ErrorCode::Generic, "spawn_blocking join error: {}", e)),
             TaskOp::BlockingWithConnection {
                 f,
                 adapter_type,
                 max_threads,
             } => {
                 let _guard = ConnectionBackpressure::from_config(adapter_type, max_threads).await;
-                let span = tracing::Span::current();
-                tokio::task::spawn_blocking(move || {
-                    let _sp = span.enter();
+                dbt_common::tracing::spawn_blocking_traced(Box::new(move || {
+                    let _recycle_guard = ThreadLocalConnectionRecycleGuard::new();
                     f()
-                })
+                }))
                 .await
                 .map_err(|e| fs_err!(ErrorCode::Generic, "spawn_blocking join error: {}", e))
             }
@@ -231,4 +229,26 @@ pub trait Task: Send + Sync {
 
         builder.build()
     }
+}
+
+pub struct TasksForNode {
+    pub renderable: Option<Arc<dyn Task>>,
+    pub analyzeable: Option<Arc<dyn Task>>,
+    pub runnable: Option<Arc<dyn Task>>,
+    pub showable: Option<Arc<dyn Task>>,
+}
+
+/// Get the tasks for a node based on the phases and execute type
+pub trait TasksForNodeFactory: Send + Sync {
+    fn tasks_for_node(
+        &self,
+        unique_id: &str,
+        nodes: &Nodes,
+        schedule: &Schedule<String>,
+        execute: Execute,
+        phases: &[TP],
+        generic_test_aggregation: Option<&GenericTestAggregation>,
+        unit_test_overrides: Option<&UnitTestOverrides>,
+        reverse_deps: &HashMap<String, HashSet<String>>,
+    ) -> TasksForNode;
 }

@@ -63,6 +63,81 @@ impl ::prost::Name for QueryExecuted {
         "/v1.public.events.fusion.query.QueryExecuted".into()
     }
 }
+/// Time spent waiting for connection concurrency limits to allow a node to proceed.
+#[cfg_attr(any(test, feature = "test-utils"), derive(::fake::Dummy))]
+#[derive(crate::macros::ProtoNew)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ConnectionLimitWait {
+    /// Number of active nodes in task runner. Empty unless trace log level is set.
+    #[prost(uint32, optional, tag = "1")]
+    pub active_nodes: ::core::option::Option<u32>,
+    /// Number of active adapter connections. Empty unless trace log level is set.
+    #[prost(uint32, optional, tag = "2")]
+    pub active_connections: ::core::option::Option<u32>,
+}
+impl crate::StaticName for ConnectionLimitWait {
+    const FULL_NAME: &'static str = "v1.public.events.fusion.query.ConnectionLimitWait";
+    const TYPE_URL: &'static str = "/v1.public.events.fusion.query.ConnectionLimitWait";
+}
+impl ::prost::Name for ConnectionLimitWait {
+    const NAME: &'static str = "ConnectionLimitWait";
+    const PACKAGE: &'static str = "v1.public.events.fusion.query";
+    fn full_name() -> ::prost::alloc::string::String {
+        "v1.public.events.fusion.query.ConnectionLimitWait".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/v1.public.events.fusion.query.ConnectionLimitWait".into()
+    }
+}
+/// Event emitted when an adapter connection is opened. Only emitted at trace log level.
+#[cfg_attr(any(test, feature = "test-utils"), derive(::fake::Dummy))]
+#[derive(crate::macros::ProtoNew)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AdapterConnectionOpen {
+    /// Adapter type name
+    #[prost(string, tag = "1")]
+    pub adapter_type: ::prost::alloc::string::String,
+    /// Adapter backend (driver) name
+    #[prost(string, tag = "2")]
+    pub adapter_backend: ::prost::alloc::string::String,
+}
+impl crate::StaticName for AdapterConnectionOpen {
+    const FULL_NAME: &'static str = "v1.public.events.fusion.query.AdapterConnectionOpen";
+    const TYPE_URL: &'static str = "/v1.public.events.fusion.query.AdapterConnectionOpen";
+}
+impl ::prost::Name for AdapterConnectionOpen {
+    const NAME: &'static str = "AdapterConnectionOpen";
+    const PACKAGE: &'static str = "v1.public.events.fusion.query";
+    fn full_name() -> ::prost::alloc::string::String {
+        "v1.public.events.fusion.query.AdapterConnectionOpen".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/v1.public.events.fusion.query.AdapterConnectionOpen".into()
+    }
+}
+/// Event emitted when an adapter connection is closed. Only emitted at trace log level.
+#[cfg_attr(any(test, feature = "test-utils"), derive(::fake::Dummy))]
+#[derive(crate::macros::ProtoNew)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AdapterConnectionClose {
+    /// Debug representation of the adapter connection being closed.
+    #[prost(string, tag = "1")]
+    pub repr: ::prost::alloc::string::String,
+}
+impl crate::StaticName for AdapterConnectionClose {
+    const FULL_NAME: &'static str = "v1.public.events.fusion.query.AdapterConnectionClose";
+    const TYPE_URL: &'static str = "/v1.public.events.fusion.query.AdapterConnectionClose";
+}
+impl ::prost::Name for AdapterConnectionClose {
+    const NAME: &'static str = "AdapterConnectionClose";
+    const PACKAGE: &'static str = "v1.public.events.fusion.query";
+    fn full_name() -> ::prost::alloc::string::String {
+        "v1.public.events.fusion.query.AdapterConnectionClose".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/v1.public.events.fusion.query.AdapterConnectionClose".into()
+    }
+}
 /// Outcome of a query execution
 #[cfg_attr(any(test, feature = "test-utils"), derive(::fake::Dummy))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

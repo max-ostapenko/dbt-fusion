@@ -306,6 +306,7 @@ impl From<ProjectSourceConfig> for SourceConfig {
                 row_access_policy: None,
                 automatic_clustering: None,
                 copy_grants: None,
+                copy_tags: None,
                 secure: None,
                 transient: None,
                 iceberg_version: None,
@@ -558,4 +559,52 @@ impl ResolvableConfig<SourceConfig> for SourceConfig {
 impl ConfigKeys for SourceConfig {
     // The default implementation from the trait will handle
     // extracting field names via serialization automatically
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SourceConfig;
+    use dbt_common::serde_utils::Omissible;
+
+    #[test]
+    fn test_source_config_freshness_loaded_at_field_parses() {
+        let config: SourceConfig = dbt_yaml::from_str(
+            r#"
+freshness:
+  loaded_at_field: FRESHNESS_LOADED_AT
+__warehouse_specific_config__: {}
+"#,
+        )
+        .unwrap();
+
+        let Omissible::Present(Some(freshness)) = config.freshness else {
+            panic!("freshness config should parse");
+        };
+        assert_eq!(
+            freshness.loaded_at_field.as_deref(),
+            Some("FRESHNESS_LOADED_AT")
+        );
+        assert_eq!(freshness.loaded_at_query, None);
+    }
+
+    #[test]
+    fn test_source_config_freshness_loaded_at_query_parses() {
+        let config: SourceConfig = dbt_yaml::from_str(
+            r#"
+freshness:
+  loaded_at_query: select max(loaded_at) from {{ source('raw', 'events') }}
+__warehouse_specific_config__: {}
+"#,
+        )
+        .unwrap();
+
+        let Omissible::Present(Some(freshness)) = config.freshness else {
+            panic!("freshness config should parse");
+        };
+        assert_eq!(freshness.loaded_at_field, None);
+        assert_eq!(
+            freshness.loaded_at_query.as_deref(),
+            Some("select max(loaded_at) from {{ source('raw', 'events') }}")
+        );
+    }
 }

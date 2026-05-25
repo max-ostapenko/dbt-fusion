@@ -1,11 +1,12 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
+use crate::config::CompilationConfig;
 use dbt_adapter::{
     Adapter, AdapterEngine, AdapterImpl, AdapterType,
     adapter::AdapterFactory,
@@ -22,7 +23,6 @@ use dbt_common::{
     tracing::TracingConfigProvider,
 };
 use dbt_error::{ErrorCode, FsResult, fs_err};
-use dbt_features::compilation::CompilationConfig;
 use dbt_jinja_utils::{
     flags::Flags, jinja_environment::JinjaEnv, listener::JinjaTypeCheckingEventListenerFactory,
 };
@@ -39,11 +39,8 @@ use dbt_schema_store::SchemaStoreTrait;
 use dbt_schemas::{
     dbt_utils::resolve_package_quoting,
     schemas::{
-        ResolvedCloudConfig,
-        common::{DbtQuoting, ResolvedQuoting},
-        macros::build_macro_units,
-        profiles::Execute,
-        project::{DbtProject, QueryComment},
+        ResolvedCloudConfig, common::DbtQuoting, macros::build_macro_units, profiles::Execute,
+        project::DbtProject, relations::DEFAULT_RESOLVED_QUOTING,
     },
     state::{
         CacheState, DbtPackage, DbtState, GetColumnsInRelationCalls, GetRelationCalls,
@@ -55,6 +52,7 @@ use dbt_xdbc::Backend;
 pub struct DbtLoadedProject {
     config: CompilationConfig,
     type_ops_factory: Arc<dyn TypeOpsFactory>,
+    /// DO NOT EXPOSE. Callers should use [DbtLoadedProject::init_adapter].
     adapter_factory: Arc<dyn AdapterFactory>,
     dbt_state: Arc<DbtState>,
 }
@@ -187,16 +185,35 @@ fn is_resource_changeable(kind: &ResourcePathKind) -> bool {
 }
 
 // TODO: Chenyu this will be moved to use CAS as previous state on next PR.
+fn is_internal_package(pkg: &DbtPackage) -> bool {
+    pkg.package_root_path
+        .components()
+        .any(|c| c.as_os_str() == "dbt_internal_packages")
+}
+
 async fn compute_file_changeset(
     prev_dbt_state: &DbtState,
     current_dbt_state: &DbtState,
     token: &CancellationToken,
 ) -> FsResult<FileChangeset> {
-    let prev_packages = &prev_dbt_state.packages;
-    let current_packages = &current_dbt_state.packages;
+    let prev_packages: Vec<_> = prev_dbt_state
+        .packages
+        .iter()
+        .filter(|p| !is_internal_package(p))
+        .collect();
+    let current_packages: Vec<_> = current_dbt_state
+        .packages
+        .iter()
+        .filter(|p| !is_internal_package(p))
+        .collect();
 
     if prev_packages.len() != current_packages.len() {
-        return Err(fs_err!(ErrorCode::CacheError, "Number of packages changed"));
+        return Err(fs_err!(
+            ErrorCode::CacheError,
+            "Number of packages changed: prev={} current={}",
+            prev_packages.len(),
+            current_packages.len()
+        ));
     }
 
     let mut changed = Vec::new();
@@ -206,8 +223,15 @@ async fn compute_file_changeset(
         let prev_package = &prev_packages[i];
         let current_package = &current_packages[i];
 
+        // Packages must appear in the same order across runs (insertion order from loader).
+        // Verify both identity and position so a reordering produces a clear message.
         if prev_package.package_root_path != current_package.package_root_path {
-            return Err(fs_err!(ErrorCode::CacheError, "Packages changed"));
+            return Err(fs_err!(
+                ErrorCode::CacheError,
+                "Package at index {i} changed: prev='{}' current='{}'",
+                prev_package.dbt_project.name,
+                current_package.dbt_project.name
+            ));
         }
 
         let prev_fs_timestamps = prev_package.all_paths.clone();
@@ -217,7 +241,13 @@ async fn compute_file_changeset(
             HashSet::from_iter(prev_fs_timestamps.keys());
         let new_fs_keys = HashSet::from_iter(new_fs_timestamps.keys());
         if prev_fs_keys != new_fs_keys {
-            return Err(fs_err!(ErrorCode::CacheError, "Resource kinds changed"));
+            return Err(fs_err!(
+                ErrorCode::CacheError,
+                "Resource kinds changed in package '{}': prev={:?} current={:?}",
+                prev_package.dbt_project.name,
+                prev_fs_keys,
+                new_fs_keys
+            ));
         }
 
         for (key, prev_value) in prev_fs_timestamps {
@@ -236,7 +266,14 @@ async fn compute_file_changeset(
                 current_value.iter().map(|x| (&x.0, x.1)).collect();
 
             if prev_fs.len() != current_fs.len() {
-                return Err(fs_err!(ErrorCode::CacheError, "Input files changed"));
+                return Err(fs_err!(
+                    ErrorCode::CacheError,
+                    "File count changed in package '{}' kind '{:?}': prev={} current={}",
+                    prev_package.dbt_project.name,
+                    key,
+                    prev_fs.len(),
+                    current_fs.len()
+                ));
             }
 
             for current in current_fs.iter() {
@@ -244,7 +281,12 @@ async fn compute_file_changeset(
                 // Using [std::path::Path] for the lookup here means
                 // it will always be case-sensitive.
                 let Some(prev_timestamp) = prev_fs.get(current.0.as_path()) else {
-                    return Err(fs_err!(ErrorCode::CacheError, "Input files changed"));
+                    return Err(fs_err!(
+                        ErrorCode::CacheError,
+                        "File '{}' appeared in package '{}' (not in previous cache)",
+                        current.0.display(),
+                        current_package.dbt_project.name
+                    ));
                 };
                 if current.1 != prev_timestamp {
                     if is_doc && !current.0.has_extension("md") {
@@ -252,12 +294,22 @@ async fn compute_file_changeset(
                         continue;
                     }
                     if !is_resource_changeable(&key) {
-                        return Err(fs_err!(ErrorCode::CacheError, "Input file changed"));
+                        return Err(fs_err!(
+                            ErrorCode::CacheError,
+                            "Non-incremental file changed: '{}' (kind {:?}) — full parse required",
+                            current.0.display(),
+                            key
+                        ));
                     }
+                    // Only root-package (i=0) model/analysis changes are safe for incremental.
+                    // Changes in dependency packages require a full parse because their nodes
+                    // may be referenced by the root and cannot be partially re-resolved.
                     if i > 0 {
                         return Err(fs_err!(
                             ErrorCode::CacheError,
-                            "Dependent package contents changed"
+                            "File '{}' changed in dependency package '{}' — full parse required",
+                            current.0.display(),
+                            current_package.dbt_project.name
                         ));
                     }
                     // The paths in all_paths are already absolute paths
@@ -338,148 +390,6 @@ async fn load_cache(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn init_adapter_core(
-    arg: &IoArgs,
-    replay_mode: Option<ReplayMode>,
-    adapter_type: AdapterType,
-    db_config: dbt_yaml::Mapping,
-    type_ops_factory: Arc<dyn TypeOpsFactory>,
-    adapter_factory: &dyn AdapterFactory,
-    env: &JinjaEnv,
-    schema_store: Option<Arc<dyn SchemaStoreTrait>>,
-    root_project_quoting: ResolvedQuoting,
-    query_comment: Option<QueryComment>,
-    cloud_config: Option<&ResolvedCloudConfig>,
-    token: CancellationToken,
-    execute: Execute,
-    sidecar_client: Option<Arc<dyn SidecarClient>>,
-    threads: Option<usize>,
-) -> FsResult<Arc<Adapter>> {
-    let flags = env
-        .get_global("flags")
-        .ok_or_else(|| {
-            fs_err!(
-                ErrorCode::InvalidConfig,
-                "There must be flags in the global variable",
-            )
-        })?
-        .downcast_object::<Flags>()
-        .ok_or_else(|| fs_err!(ErrorCode::InvalidConfig, "Could not downcast flags"))?;
-
-    let introspect_enabled = flags
-        .to_dict()
-        .get("introspect")
-        .is_none_or(|value| value.is_true());
-
-    // If executing locally, avoid creating a real remote engine entirely to guarantee
-    // no network calls are made, even if adapter macros are accidentally invoked.
-    // This applies to Local, Sidecar, and Service execution modes - all use local/runner execution.
-    // This mode also applies to compile with --no-introspect
-    // DuckDB is a local database — use the AdapterFactory for proper adapter creation
-    // instead of a MockAdapter, so we get real query logging and telemetry.
-    let adapter = if adapter_type == AdapterType::DuckDB {
-        adapter_factory
-            .create_adapter(
-                adapter_type,
-                db_config,
-                Arc::clone(&type_ops_factory),
-                replay_mode,
-                flags.project_flags(),
-                schema_store,
-                None,
-                root_project_quoting,
-                query_comment,
-                token,
-                cloud_config,
-                threads,
-            )
-            .map_err(|e| {
-                fs_err!(
-                    ErrorCode::InvalidConfig,
-                    "Could not create DuckDB adapter: {}",
-                    e
-                )
-            })?
-    } else if !introspect_enabled
-        || matches!(
-            execute,
-            Execute::Local | Execute::Sidecar | Execute::Service
-        )
-    {
-        // Construct a MockAdapter wrapped in Adapter
-        let type_ops = type_ops_factory.create(adapter_type);
-
-        if let Some(client) = sidecar_client {
-            // For sidecar/service mode with a sidecar client, use AdapterImpl
-            // wrapping a SidecarEngine which routes introspection (get_columns_in_relation,
-            // list_relations, get_relation) to the sidecar client.
-            let sidecar_engine = SidecarEngine::new(
-                adapter_type,
-                Backend::DuckDBExtended,
-                client,
-                root_project_quoting,
-                AdapterConfig::default(),
-                type_ops_factory.create(adapter_type),
-                adapter_factory.stmt_splitter(),
-                QueryCommentConfig::from_query_comment(None, adapter_type, false, None),
-                Arc::new(RelationCache::default()),
-            );
-            let adapter_impl = AdapterImpl::new(
-                Arc::new(sidecar_engine) as Arc<dyn AdapterEngine>,
-                schema_store,
-            );
-            Arc::new(Adapter::new(Arc::new(adapter_impl), None, token))
-        } else {
-            // Execute::Local or fallback: use mock adapter
-            let mock = AdapterImpl::new_mock(
-                adapter_type,
-                flags.project_flags(),
-                root_project_quoting,
-                type_ops,
-                adapter_factory.stmt_splitter(),
-            );
-            Arc::new(Adapter::new(Arc::new(mock), None, token))
-        }
-    } else {
-        adapter_factory
-            .create_adapter(
-                adapter_type,
-                db_config,
-                Arc::clone(&type_ops_factory),
-                replay_mode,
-                flags.project_flags(),
-                schema_store,
-                if arg.beta_use_query_cache {
-                    Some(Arc::new(QueryCacheImpl::new(QueryCacheConfig::new(
-                        arg.out_dir.join("query_cache"),
-                        Some(Duration::from_secs(60 * 60 * 12)),
-                        vec![
-                            dbt_adapter_core::DBT_EXECUTION_PHASE_RENDER,
-                            dbt_adapter_core::DBT_EXECUTION_PHASE_ANALYZE,
-                        ],
-                    ))))
-                } else {
-                    None
-                },
-                root_project_quoting,
-                query_comment,
-                token,
-                cloud_config,
-                threads,
-            )
-            .map_err(|e| {
-                fs_err!(
-                    ErrorCode::InvalidConfig,
-                    "Failed to initialize adapter: {}",
-                    e
-                )
-            })?
-    };
-
-    Ok(adapter)
-}
-
 impl DbtLoadedProject {
     pub async fn load(
         config: CompilationConfig,
@@ -506,6 +416,10 @@ impl DbtLoadedProject {
 
     pub fn config(&self) -> &CompilationConfig {
         &self.config
+    }
+
+    pub fn type_ops_factory(&self) -> &Arc<dyn TypeOpsFactory> {
+        &self.type_ops_factory
     }
 
     pub fn dbt_state(&self) -> Arc<DbtState> {
@@ -553,14 +467,6 @@ impl DbtLoadedProject {
             adapter_factory,
             dbt_state,
         }
-    }
-
-    pub fn type_ops_factory(&self) -> &Arc<dyn TypeOpsFactory> {
-        &self.type_ops_factory
-    }
-
-    pub fn adapter_factory(&self) -> &Arc<dyn AdapterFactory> {
-        &self.adapter_factory
     }
 
     pub fn create_jinja_env(
@@ -627,7 +533,7 @@ impl DbtLoadedProject {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn init_adapter(
+    pub fn init_adapter(
         &self,
         resolved_state: &ResolverState,
         io: &IoArgs,
@@ -638,23 +544,167 @@ impl DbtLoadedProject {
         sidecar_client: Option<Arc<dyn SidecarClient>>,
         execute: Execute,
     ) -> FsResult<Arc<Adapter>> {
-        init_adapter_core(
-            io,
-            replay_mode,
-            resolved_state.adapter_type,
-            resolved_state.dbt_profile.db_config.to_mapping().unwrap(),
-            Arc::clone(self.type_ops_factory()),
-            self.adapter_factory().as_ref(),
-            jinja_env,
-            schema_store,
-            resolved_state.root_project_quoting,
-            resolved_state.runtime_config.inner.query_comment.clone(),
-            self.dbt_cloud_config(),
-            token.clone(),
-            execute,
-            sidecar_client,
-            resolved_state.dbt_profile.threads,
+        let adapter_factory = self.adapter_factory.clone();
+        let type_ops_factory = self.type_ops_factory.clone();
+        let adapter_type = resolved_state.adapter_type;
+        let db_config = resolved_state.dbt_profile.db_config.to_mapping().unwrap();
+        let root_project_quoting = resolved_state.root_project_quoting;
+        let query_comment = resolved_state.runtime_config.inner.query_comment.clone();
+        let cloud_config = self.dbt_cloud_config();
+        let threads = resolved_state.dbt_profile.threads;
+
+        let flags = jinja_env
+            .get_global("flags")
+            .ok_or_else(|| {
+                fs_err!(
+                    ErrorCode::InvalidConfig,
+                    "There must be flags in the global variable",
+                )
+            })?
+            .downcast_object::<Flags>()
+            .ok_or_else(|| fs_err!(ErrorCode::InvalidConfig, "Could not downcast flags"))?;
+
+        let introspect_enabled = flags
+            .to_dict()
+            .get("introspect")
+            .is_none_or(|value| value.is_true());
+
+        // If executing locally, avoid creating a real remote engine entirely to guarantee
+        // no network calls are made, even if adapter macros are accidentally invoked.
+        // This applies to Local, Sidecar, and Service execution modes - all use local/runner execution.
+        // This mode also applies to compile with --no-introspect
+        // DuckDB is a local database — use the AdapterFactory for proper adapter creation
+        // instead of a MockAdapter, so we get real query logging and telemetry.
+        //
+        // Under `--dbt-replay`, the mock/sidecar adapter below has no metadata
+        // adapter, so unit-test `given` upstream schemas cannot resolve from the
+        // recording. Route those runs through the factory so it builds a replay
+        // adapter instead; sidecar execution still goes through the db_runner.
+        let is_mantle_replay = matches!(&replay_mode, Some(ReplayMode::MantleReplay(_)));
+        let executes_locally = !introspect_enabled
+            || matches!(
+                execute,
+                Execute::Local | Execute::Sidecar | Execute::Service
+            );
+        let use_local_mock_adapter = executes_locally && !is_mantle_replay;
+        let adapter = if adapter_type == AdapterType::DuckDB {
+            adapter_factory
+                .create_adapter(
+                    adapter_type,
+                    db_config,
+                    type_ops_factory,
+                    replay_mode,
+                    flags.project_flags(),
+                    schema_store,
+                    None,
+                    root_project_quoting,
+                    query_comment,
+                    token.clone(),
+                    cloud_config,
+                    threads,
+                )
+                .map_err(|e| {
+                    fs_err!(
+                        ErrorCode::InvalidConfig,
+                        "Could not create DuckDB adapter: {}",
+                        e
+                    )
+                })?
+        } else if use_local_mock_adapter {
+            // Construct a MockAdapter wrapped in Adapter
+            let type_ops = type_ops_factory.create(adapter_type);
+
+            if let Some(client) = sidecar_client {
+                // For sidecar/service mode with a sidecar client, use AdapterImpl
+                // wrapping a SidecarEngine which routes introspection (get_columns_in_relation,
+                // list_relations, get_relation) to the sidecar client.
+                let sidecar_engine = SidecarEngine::new(
+                    adapter_type,
+                    Backend::DuckDBExtended,
+                    client,
+                    root_project_quoting,
+                    AdapterConfig::default(),
+                    type_ops_factory.create(adapter_type),
+                    adapter_factory.stmt_splitter(),
+                    QueryCommentConfig::from_query_comment(None, adapter_type, false, None),
+                    Arc::new(RelationCache::default()),
+                );
+                let adapter_impl = AdapterImpl::new(
+                    Arc::new(sidecar_engine) as Arc<dyn AdapterEngine>,
+                    schema_store,
+                );
+                Arc::new(Adapter::new(Arc::new(adapter_impl), None, token.clone()))
+            } else {
+                // Execute::Local or fallback: use mock adapter
+                let mock = AdapterImpl::new_mock(
+                    adapter_type,
+                    flags.project_flags(),
+                    root_project_quoting,
+                    type_ops,
+                    adapter_factory.stmt_splitter(),
+                );
+                Arc::new(Adapter::new(Arc::new(mock), None, token.clone()))
+            }
+        } else {
+            adapter_factory
+                .create_adapter(
+                    adapter_type,
+                    db_config,
+                    Arc::clone(&type_ops_factory),
+                    replay_mode,
+                    flags.project_flags(),
+                    schema_store,
+                    if io.beta_use_query_cache {
+                        Some(Arc::new(QueryCacheImpl::new(QueryCacheConfig::new(
+                            io.out_dir.join("query_cache"),
+                            Some(Duration::from_secs(60 * 60 * 12)),
+                            vec![
+                                dbt_adapter_core::DBT_EXECUTION_PHASE_RENDER,
+                                dbt_adapter_core::DBT_EXECUTION_PHASE_ANALYZE,
+                            ],
+                        ))))
+                    } else {
+                        None
+                    },
+                    root_project_quoting,
+                    query_comment,
+                    token.clone(),
+                    cloud_config,
+                    threads,
+                )
+                .map_err(|e| {
+                    fs_err!(
+                        ErrorCode::InvalidConfig,
+                        "Failed to initialize adapter: {}",
+                        e
+                    )
+                })?
+        };
+
+        Ok(adapter)
+    }
+
+    pub fn init_base_adapter(
+        &self,
+        adapter_type: AdapterType,
+        config_as_mapping: dbt_yaml::Mapping,
+        token: CancellationToken,
+    ) -> FsResult<Arc<Adapter>> {
+        let type_ops_factory = self.type_ops_factory.clone();
+
+        self.adapter_factory.create_adapter(
+            adapter_type,
+            config_as_mapping,
+            type_ops_factory,
+            None, // replay_mode
+            BTreeMap::new(),
+            None,
+            None,
+            DEFAULT_RESOLVED_QUOTING,
+            None,
+            token,
+            None, // cloud_config — debug only runs `select 1`, cloud query comments not needed
+            None, // threads
         )
-        .await
     }
 }

@@ -16,6 +16,7 @@ use crate::macro_exec::{
 };
 use crate::metadata::bigquery::BigqueryMetadataAdapter;
 use crate::metadata::bigquery::nest_column_data_types;
+use crate::metadata::clickhouse::ClickHouseMetadataAdapter;
 use crate::metadata::databricks::DatabricksMetadataAdapter;
 use crate::metadata::databricks::dbr_capabilities;
 use crate::metadata::databricks::version::EngineVersion;
@@ -28,10 +29,10 @@ use crate::metadata::snowflake::SnowflakeMetadataAdapter;
 use crate::metadata::{self, CatalogAndSchema, MetadataAdapter};
 use crate::query_ctx::{node_id_from_state, query_ctx_from_state};
 use crate::record_batch::{RecordBatchExt, RenamedColumn};
+use crate::relation::Relation;
 use crate::relation::RelationObject;
 use crate::relation::config_v2::{ComponentConfigLoader, RelationConfig};
 use crate::relation::databricks::config::DatabricksRelationMetadata;
-use crate::relation::snowflake::SnowflakeRelation;
 use crate::render_constraint::render_column_constraint;
 use crate::response::{AdapterResponse, ResultObject};
 use crate::snapshots::SnapshotStrategy;
@@ -238,7 +239,8 @@ impl AdapterImpl {
                         Fabric => {
                             Box::new(FabricMetadataAdapter::new(engine)) as Box<dyn MetadataAdapter>
                         }
-                        ClickHouse => todo!("ClickHouse"),
+                        ClickHouse => Box::new(ClickHouseMetadataAdapter::new(engine))
+                            as Box<dyn MetadataAdapter>,
                         Exasol => return None,
                         Starburst => todo!("Starburst"),
                         Athena => todo!("Athena"),
@@ -453,8 +455,8 @@ impl AdapterImpl {
             Redshift => &[Append, DeleteInsert, Merge, Microbatch],
             Fabric => &[Append, DeleteInsert, Merge, Microbatch],
             Salesforce => &[Append, Merge],
-            Spark | ClickHouse | Exasol | Athena | Starburst | Trino | Datafusion | Dremio
-            | Oracle => {
+            ClickHouse => &[Append, DeleteInsert, InsertOverwrite, Microbatch, Legacy],
+            Spark | Exasol | Athena | Starburst | Trino | Datafusion | Dremio | Oracle => {
                 unimplemented!("valid_incremental_strategies not implemented")
             }
         }
@@ -917,7 +919,8 @@ impl AdapterImpl {
                 Postgres => "nspname",
                 DuckDB => "schema_name",
                 Fabric => "schema",
-                ClickHouse => todo!("ClickHouse"),
+                // https://github.com/ClickHouse/dbt-clickhouse/blob/main/dbt/include/clickhouse/macros/adapters.sql
+                ClickHouse => "name",
                 Exasol => "name",
                 Starburst => todo!("Starburst"),
                 Athena => todo!("Athena"),
@@ -1023,14 +1026,20 @@ impl AdapterImpl {
                     "Introspective queries are disabled (--no-introspect).",
                 ));
             }
-            return Ok(Some(Arc::new(SnowflakeRelation::new(
+            let mut relation = Relation::new(
+                Snowflake,
                 Some(database.to_string()),
                 Some(schema.to_string()),
                 Some(identifier.to_string()),
                 None,
-                TableFormat::Default,
+                None,
                 self.quoting(),
-            ))));
+                None,
+                false,
+                false,
+            );
+            relation.table_format = TableFormat::Default;
+            return Ok(Some(Arc::new(relation)));
         }
         match self.inner_adapter() {
             Replay(_, replay) => {
@@ -1625,13 +1634,14 @@ impl AdapterImpl {
                     "dbt_databricks",
                 )
             }
-            Postgres | Snowflake | Redshift | DuckDB | Fabric | Spark => execute_macro(
-                state,
-                &[RelationObject::new(relation.to_owned()).into_value()],
-                "get_columns_in_relation",
-            ),
-            Salesforce | ClickHouse | Exasol | Starburst | Athena | Trino | Datafusion | Dremio
-            | Oracle => {
+            Postgres | Snowflake | Redshift | DuckDB | Fabric | Spark | ClickHouse => {
+                execute_macro(
+                    state,
+                    &[RelationObject::new(relation.to_owned()).into_value()],
+                    "get_columns_in_relation",
+                )
+            }
+            Salesforce | Exasol | Starburst | Athena | Trino | Datafusion | Dremio | Oracle => {
                 unimplemented!("get_columns_in_relation not implemented")
             }
         };
@@ -1718,8 +1728,11 @@ impl AdapterImpl {
                     .collect::<Vec<_>>();
                 Ok(columns)
             }
-            Salesforce | ClickHouse | Exasol | Starburst | Athena | Trino | Datafusion | Dremio
-            | Oracle => {
+            ClickHouse => {
+                let result = macro_execution_result?;
+                Ok(Column::vec_from_jinja_value(ClickHouse, result)?)
+            }
+            Salesforce | Exasol | Starburst | Athena | Trino | Datafusion | Dremio | Oracle => {
                 unimplemented!("get_columns_in_relation not implemented")
             }
         }
@@ -2108,10 +2121,15 @@ impl AdapterImpl {
 
     /// BaseAdapter https://github.com/dbt-labs/dbt-adapters/blob/0efd8d3d1081e1ab43e38797d5104f7b424a6284/dbt-adapters/src/dbt/adapters/base/impl.py#L1816
     pub fn render_column_constraint(&self, constraint: Constraint) -> Option<String> {
-        // TODO: revisit to support warn_supported, warn_unenforced
-        let constraint_support = self.get_constraint_support(constraint.type_);
-        if constraint_support == ConstraintSupport::NotSupported {
-            return None;
+        // Custom constraints bypass the support check — dbt-adapters intentionally
+        // short-circuits enforcement for custom and passes the expression verbatim.
+        // https://github.com/dbt-labs/dbt-adapters/blob/main/dbt-adapters/src/dbt/adapters/base/impl.py#L1908-L1909
+        if constraint.type_ != ConstraintType::Custom {
+            // TODO: revisit to support warn_supported, warn_unenforced
+            let constraint_support = self.get_constraint_support(constraint.type_);
+            if constraint_support == ConstraintSupport::NotSupported {
+                return None;
+            }
         }
 
         let constraint_expression = constraint.expression.unwrap_or_default();
@@ -2858,7 +2876,7 @@ impl AdapterImpl {
     pub fn verify_database(&self, database: String) -> AdapterResult<Value> {
         match self.inner_adapter() {
             Replay(_, replay) => replay.replay_verify_database(&database),
-            Impl(adapter_type @ (Postgres | DuckDB), engine) => {
+            Impl(adapter_type @ (Postgres | DuckDB | ClickHouse), engine) => {
                 if let Some(configured_database) = engine.get_configured_database_name() {
                     if database == configured_database {
                         Ok(Value::from(()))
@@ -2902,8 +2920,8 @@ impl AdapterImpl {
             }
             Impl(
                 adapter_type @ (Snowflake | Bigquery | Databricks | Salesforce | Spark | Fabric
-                | ClickHouse | Exasol | Starburst | Athena | Trino | Datafusion
-                | Dremio | Oracle),
+                | Exasol | Starburst | Athena | Trino | Datafusion | Dremio
+                | Oracle),
                 _,
             ) => {
                 unimplemented!(
@@ -4212,6 +4230,7 @@ fn builtin_incremental_strategies() -> Vec<DbtIncrementalStrategy> {
         DbtIncrementalStrategy::Merge,
         DbtIncrementalStrategy::InsertOverwrite,
         DbtIncrementalStrategy::Microbatch,
+        DbtIncrementalStrategy::Legacy, // ClickHouse only — intermediate-table + swap
     ]
 }
 
@@ -5319,7 +5338,6 @@ mod tests {
     }
 
     // -- BigQuery reservation tests -------------------------------------------
-
     #[test]
     fn test_bigquery_adbc_options_no_reservation_when_not_configured() {
         let adapter = AdapterImpl::new(engine(Bigquery), None);
@@ -5344,6 +5362,29 @@ mod tests {
         assert_eq!(
             find_reservation(&options),
             Some("projects/project1/locations/US/reservations/my-reservation".to_string())
+        );
+    }
+
+    // Regression test for https://github.com/dbt-labs/dbt-fusion/issues/1733:
+    // type:custom column constraints were silently dropped because get_constraint_support
+    // returns NotSupported for Custom on all adapters, and the NotSupported guard ran
+    // before the Custom arm in the match — bypassing the expression entirely.
+    #[test]
+    fn test_render_column_constraint_custom_snowflake() {
+        let adapter = AdapterImpl::new(engine(Snowflake), None);
+        let constraint = Constraint {
+            type_: ConstraintType::Custom,
+            expression: Some("with tag (governance.masking.pii_type = 'SSN')".to_string()),
+            name: None,
+            to: None,
+            to_columns: None,
+            warn_unsupported: None,
+            warn_unenforced: None,
+        };
+        let rendered = adapter.render_column_constraint(constraint);
+        assert_eq!(
+            rendered,
+            Some("with tag (governance.masking.pii_type = 'SSN')".to_string())
         );
     }
 
@@ -5383,5 +5424,20 @@ mod tests {
             find_reservation(&options),
             Some("projects/project1/locations/US/reservations/model-reservation".to_string())
         );
+    }
+          
+    #[test]
+    fn test_render_column_constraint_custom_empty_expression_returns_none() {
+        let adapter = AdapterImpl::new(engine(Snowflake), None);
+        let constraint = Constraint {
+            type_: ConstraintType::Custom,
+            expression: None,
+            name: None,
+            to: None,
+            to_columns: None,
+            warn_unsupported: None,
+            warn_unenforced: None,
+        };
+        assert!(adapter.render_column_constraint(constraint).is_none());
     }
 }

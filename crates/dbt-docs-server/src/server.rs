@@ -7,9 +7,11 @@ use tracing::info;
 
 use crate::DocsServeArgs;
 
-use crate::embed::serve_assets;
+use crate::assets::serve_assets;
 use crate::handlers::{
-    capabilities, column_lineage, files, health, lineage, models, nodes, project, query,
+    capabilities, column_lineage, distribution, exposures, files, groups, health, lineage, macros,
+    metrics, models, nodes, project, query, saved_queries, seeds, semantic_models, snapshots,
+    sources, tests,
 };
 use crate::providers::Providers;
 use crate::resolve_index_dir;
@@ -30,10 +32,35 @@ async fn serve(args: Arc<DocsServeArgs>, state: Arc<AppState>) -> io::Result<()>
     let app = Router::new()
         .route("/api/v1/health", get(health::get_health))
         .route("/api/v1/capabilities", get(capabilities::get_capabilities))
+        .route("/api/v1/distribution", get(distribution::get_distribution))
         .route("/api/v1/project", get(project::get_project))
         .route("/api/v1/models", get(models::list_models))
         .route("/api/v1/models/facets", get(models::list_model_facets))
         .route("/api/v1/models/{unique_id}", get(models::get_model))
+        .route("/api/v1/sources", get(sources::list_sources))
+        .route("/api/v1/sources/facets", get(sources::list_source_facets))
+        .route("/api/v1/sources/{unique_id}", get(sources::get_source))
+        .route("/api/v1/groups/{unique_id}", get(groups::get_group))
+        .route("/api/v1/macros/{unique_id}", get(macros::get_macro))
+        .route("/api/v1/metrics/{unique_id}", get(metrics::get_metric))
+        .route(
+            "/api/v1/saved_queries/{unique_id}",
+            get(saved_queries::get_saved_query),
+        )
+        .route("/api/v1/seeds/{unique_id}", get(seeds::get_seed))
+        .route(
+            "/api/v1/semantic_models/{unique_id}",
+            get(semantic_models::get_semantic_model),
+        )
+        .route(
+            "/api/v1/snapshots/{unique_id}",
+            get(snapshots::get_snapshot),
+        )
+        .route("/api/v1/tests/{unique_id}", get(tests::get_test))
+        .route(
+            "/api/v1/exposures/{unique_id}",
+            get(exposures::get_exposure),
+        )
         .route("/api/v1/nodes", get(nodes::list_nodes))
         .route("/api/v1/nodes/{unique_id}", get(nodes::get_node))
         .route("/api/v1/files", get(files::list_files))

@@ -22,6 +22,8 @@ pub struct DocsServeArgs {
     pub no_open: bool,
 }
 
+mod assets;
+#[cfg(feature = "embed-ui")]
 mod embed;
 mod handlers;
 pub mod providers;
@@ -30,7 +32,7 @@ pub mod state;
 
 pub use providers::Providers;
 pub use server::run_with_args;
-pub use state::Capabilities;
+pub use state::{Capabilities, DistInfo};
 
 /// Resolve the directory containing parquet artifacts.
 ///

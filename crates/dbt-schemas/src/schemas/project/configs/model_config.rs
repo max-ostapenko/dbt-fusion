@@ -43,7 +43,7 @@ use crate::schemas::project::configs::common::{
 };
 use crate::schemas::project::dbt_project::ResolvableConfig;
 use crate::schemas::project::dbt_project::TypedRecursiveConfig;
-use crate::schemas::properties::ModelFreshness;
+use crate::schemas::properties::{ModelFreshness, ModelState};
 use crate::schemas::serde::StringOrArrayOfStrings;
 use crate::schemas::serde::{
     IndexesConfig, PrimaryKeyConfig, bool_or_string_bool, default_type, f64_or_string_f64,
@@ -143,6 +143,12 @@ pub struct ProjectModelConfig {
         deserialize_with = "bool_or_string_bool"
     )]
     pub copy_grants: Option<bool>,
+    #[serde(
+        default,
+        rename = "+copy_tags",
+        deserialize_with = "bool_or_string_bool"
+    )]
+    pub copy_tags: Option<bool>,
     #[serde(rename = "+database", alias = "+project", alias = "+data_space")]
     pub database: Omissible<Option<String>>,
     #[serde(rename = "+databricks_compute")]
@@ -199,6 +205,8 @@ pub struct ProjectModelConfig {
     pub file_format: Option<String>,
     #[serde(rename = "+freshness")]
     pub freshness: Option<ModelFreshness>,
+    #[serde(rename = "+state")]
+    pub state: Option<ModelState>,
     #[serde(rename = "+latest_version_pointer")]
     pub latest_version_pointer: Option<LatestVersionPointer>,
     #[serde(
@@ -568,6 +576,7 @@ pub struct ModelConfig {
     #[resolved(promote, expect = "static_analysis set by apply_resolve_defaults")]
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub freshness: Option<ModelFreshness>,
+    pub state: Option<ModelState>,
     pub latest_version_pointer: Option<LatestVersionPointer>,
     pub sql_header: Option<String>,
     pub location: Option<String>,
@@ -633,6 +642,7 @@ impl From<ProjectModelConfig> for ModelConfig {
             enabled: config.enabled,
             event_time: config.event_time,
             freshness: config.freshness,
+            state: config.state,
             latest_version_pointer: config.latest_version_pointer,
             full_refresh: config.full_refresh,
             grants: config.grants,
@@ -690,6 +700,7 @@ impl From<ProjectModelConfig> for ModelConfig {
                 row_access_policy: config.row_access_policy,
                 automatic_clustering: config.automatic_clustering,
                 copy_grants: config.copy_grants,
+                copy_tags: config.copy_tags,
                 secure: config.secure,
                 transient: config.transient,
                 iceberg_version: config.iceberg_version,
@@ -788,6 +799,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             enabled: config.enabled,
             event_time: config.event_time,
             freshness: config.freshness,
+            state: config.state,
             latest_version_pointer: config.latest_version_pointer,
             full_refresh: config.full_refresh,
             grants: config.grants,
@@ -862,6 +874,7 @@ impl From<ModelConfig> for ProjectModelConfig {
             intermediate_format: config.__warehouse_specific_config__.intermediate_format,
             storage_uri: config.__warehouse_specific_config__.storage_uri,
             copy_grants: config.__warehouse_specific_config__.copy_grants,
+            copy_tags: config.__warehouse_specific_config__.copy_tags,
             secure: config.__warehouse_specific_config__.secure,
             partition_by: config.__warehouse_specific_config__.partition_by,
             cluster_by: config.__warehouse_specific_config__.cluster_by,
@@ -997,6 +1010,7 @@ impl ResolvableConfig<ModelConfig> for ModelConfig {
             table_format,
             static_analysis,
             freshness,
+            state,
             latest_version_pointer,
             sql_header,
             location,
@@ -1079,6 +1093,7 @@ impl ResolvableConfig<ModelConfig> for ModelConfig {
                 table_format,
                 static_analysis,
                 freshness,
+                state,
                 latest_version_pointer,
                 sql_header,
                 location,
@@ -1211,6 +1226,7 @@ impl ModelConfig {
         let access_eq_result = access_eq(&self.access, &other.access); // Custom comparison for access
         let table_format_eq = self.table_format == other.table_format;
         let freshness_eq = self.freshness == other.freshness;
+        let state_eq = self.state == other.state;
         let latest_version_pointer_eq = self.latest_version_pointer == other.latest_version_pointer;
         let sql_header_eq = self.sql_header == other.sql_header;
         let location_eq = self.location == other.location;
@@ -1250,6 +1266,7 @@ impl ModelConfig {
             && access_eq_result
             && table_format_eq
             && freshness_eq
+            && state_eq
             && latest_version_pointer_eq
             && sql_header_eq
             && location_eq
@@ -1470,6 +1487,11 @@ impl ModelConfig {
                         )),
                     ),
                     (
+                        "state",
+                        state_eq,
+                        Some((format!("{:?}", &self.state), format!("{:?}", &other.state))),
+                    ),
+                    (
                         "latest_version_pointer",
                         latest_version_pointer_eq,
                         Some((
@@ -1679,6 +1701,63 @@ fn materialized_eq(a: &Option<DbtMaterialization>, b: &Option<DbtMaterialization
 #[cfg(test)]
 mod tests {
     use super::ModelConfig;
+    use crate::schemas::common::{FreshnessPeriod, UpdatesOn};
+    use crate::schemas::project::configs::model_config::ProjectModelConfig;
+    use crate::schemas::properties::StatePreClone;
+
+    #[test]
+    fn test_model_config_state_parses() {
+        let config: ModelConfig = dbt_yaml::from_str(
+            r#"
+state:
+  lag_tolerance:
+    count: 2
+    period: hour
+  require_fresh_data_from: all
+  evaluate_volatile_sql: true
+  pre_clone: if_missing
+  execute_hooks_on_reuse: true
+__warehouse_specific_config__: {}
+"#,
+        )
+        .unwrap();
+
+        let state = config.state.expect("state config should parse");
+        let lag_tolerance = state.lag_tolerance.expect("lag_tolerance should parse");
+        assert_eq!(lag_tolerance.count, Some(2));
+        assert_eq!(lag_tolerance.period, Some(FreshnessPeriod::hour));
+        assert_eq!(state.require_fresh_data_from, Some(UpdatesOn::All));
+        assert_eq!(state.evaluate_volatile_sql, Some(true));
+        assert_eq!(state.pre_clone, Some(StatePreClone::IfMissing));
+        assert_eq!(state.execute_hooks_on_reuse, Some(true));
+    }
+
+    #[test]
+    fn test_project_model_config_state_parses_with_plus_prefix() {
+        let config: ProjectModelConfig = dbt_yaml::from_str(
+            r#"
++state:
+  lag_tolerance:
+    count: 30
+    period: minute
+  require_fresh_data_from: any
+  evaluate_volatile_sql: false
+  pre_clone: always
+  execute_hooks_on_reuse: false
+__additional_properties__: {}
+"#,
+        )
+        .unwrap();
+
+        let state = config.state.expect("+state config should parse");
+        let lag_tolerance = state.lag_tolerance.expect("lag_tolerance should parse");
+        assert_eq!(lag_tolerance.count, Some(30));
+        assert_eq!(lag_tolerance.period, Some(FreshnessPeriod::minute));
+        assert_eq!(state.require_fresh_data_from, Some(UpdatesOn::Any));
+        assert_eq!(state.evaluate_volatile_sql, Some(false));
+        assert_eq!(state.pre_clone, Some(StatePreClone::Always));
+        assert_eq!(state.execute_hooks_on_reuse, Some(false));
+    }
 
     #[test]
     fn test_packages_append() {

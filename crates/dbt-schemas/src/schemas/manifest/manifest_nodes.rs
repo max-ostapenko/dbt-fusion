@@ -19,7 +19,7 @@ use crate::schemas::common::{HookConfig, Hooks, OnSchemaChange};
 use crate::schemas::dbt_column::Granularity;
 use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::model_config::LatestVersionPointer;
-use crate::schemas::properties::ModelFreshness;
+use crate::schemas::properties::{ModelFreshness, ModelState};
 
 use crate::schemas::serde::bool_or_string_bool;
 
@@ -339,6 +339,7 @@ pub struct ManifestDataTest {
     pub attached_node: Option<String>,
     pub test_metadata: Option<TestMetadata>,
     pub file_key_name: Option<String>,
+    pub group: Option<String>,
     pub generated_sql_file: Option<String>,
 
     pub __other__: BTreeMap<String, YmlValue>,
@@ -382,7 +383,7 @@ impl From<DbtTest> for ManifestDataTest {
                 compiled_code: None,
                 checksum: test.__common_attr__.checksum,
                 language: test.__common_attr__.language,
-                unrendered_config: Default::default(),
+                unrendered_config: test.__base_attr__.unrendered_config,
                 doc_blocks: Default::default(),
                 extra_ctes_injected: Default::default(),
                 extra_ctes: Default::default(),
@@ -397,6 +398,7 @@ impl From<DbtTest> for ManifestDataTest {
             attached_node: test.__test_attr__.attached_node,
             test_metadata: test.__test_attr__.test_metadata,
             file_key_name: test.__test_attr__.file_key_name,
+            group: test.__test_attr__.group,
             generated_sql_file: Some(
                 test.__common_attr__
                     .original_file_path
@@ -609,7 +611,7 @@ impl From<DbtSnapshot> for ManifestSnapshot {
                 compiled_code: None,
                 checksum: snapshot.__common_attr__.checksum,
                 language: snapshot.__common_attr__.language,
-                unrendered_config: Default::default(),
+                unrendered_config: snapshot.__base_attr__.unrendered_config,
                 doc_blocks: Default::default(),
                 extra_ctes_injected: Default::default(),
                 extra_ctes: Default::default(),
@@ -687,8 +689,8 @@ impl From<DbtSource> for ManifestSource {
             }),
             source_description: source.__source_attr__.source_description,
             unrendered_config: source.__base_attr__.unrendered_config,
-            unrendered_database: None,
-            unrendered_schema: None,
+            unrendered_database: source.__source_attr__.unrendered_database,
+            unrendered_schema: source.__source_attr__.unrendered_schema,
             loader: source.__source_attr__.loader,
             loaded_at_field: source.__source_attr__.loaded_at_field,
             loaded_at_query: source.__source_attr__.loaded_at_query,
@@ -886,6 +888,7 @@ pub struct ManifestModelConfig {
     pub table_format: Option<String>,
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub freshness: Option<ModelFreshness>,
+    pub state: Option<ModelState>,
     pub latest_version_pointer: Option<LatestVersionPointer>,
     pub sql_header: Option<String>,
     pub location: Option<String>,
@@ -1088,6 +1091,7 @@ impl From<ModelConfig> for ManifestModelConfig {
             table_format: config.table_format,
             static_analysis: config.static_analysis,
             freshness: config.freshness,
+            state: config.state,
             latest_version_pointer: config.latest_version_pointer,
             sql_header: config.sql_header,
             location: config.location,
@@ -1160,6 +1164,7 @@ impl From<ManifestModelConfig> for ModelConfig {
             table_format: config.table_format,
             static_analysis: config.static_analysis,
             freshness: config.freshness,
+            state: config.state,
             latest_version_pointer: config.latest_version_pointer,
             sql_header: config.sql_header,
             location: config.location,

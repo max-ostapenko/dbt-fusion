@@ -1,0 +1,21 @@
+# version intentionally omitted — `cargo ci pypi pack` stamps it in via --version.
+
+[project]
+name = "dbt-sa-cli"
+description = "dbt Fusion standalone analyzer CLI"
+authors = [{ name = "dbt Labs", email = "info@dbtlabs.com" }]
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Rust",
+  "Development Status :: 3 - Alpha",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS :: MacOS X",
+  "Operating System :: POSIX :: Linux",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Build Tools",
+]
+
+[project.urls]
+Homepage = "https://getdbt.com"
+Repository = "https://github.com/dbt-labs/dbt-fusion"

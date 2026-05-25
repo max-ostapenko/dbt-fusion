@@ -123,6 +123,10 @@ pub struct GenericTestAsset {
     pub dbt_asset: DbtAsset,
     pub resource_name: String,
     pub resource_type: String,
+    /// Set only when `resource_type == "source"`. Carries the source-collection name
+    /// (e.g. `salesforce` for `source('salesforce', 'accounts')`) so downstream code
+    /// can build the `sources.<source_name>` file_key_name that dbt-core emits.
+    pub source_name: Option<String>,
     pub test_name: String,
     pub defined_at: dbt_common::CodeLocationWithFile,
     // Structured metadata for generic tests (optional; not used for singular tests)
@@ -222,6 +226,8 @@ pub struct DbtPackage {
     /// `None` for disk-based packages, `Some(map)` for embedded packages.
     /// Keyed by relative path (same as DbtAsset.path).
     pub embedded_file_contents: Option<HashMap<DbtPath, String>>,
+    /// Raw dbt_project.yml.
+    pub raw_project_yml: dbt_yaml::Value,
 }
 
 pub use dbt_jinja_vars::DbtVars;

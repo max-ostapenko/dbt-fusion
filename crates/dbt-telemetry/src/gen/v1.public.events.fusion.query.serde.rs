@@ -1,3 +1,330 @@
+impl serde::Serialize for AdapterConnectionClose {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.repr.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("v1.public.events.fusion.query.AdapterConnectionClose", len)?;
+        if !self.repr.is_empty() {
+            struct_ser.serialize_field("repr", &self.repr)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for AdapterConnectionClose {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "repr",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Repr,
+            __SkipField__,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "repr" => Ok(GeneratedField::Repr),
+                            _ => Ok(GeneratedField::__SkipField__),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = AdapterConnectionClose;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct v1.public.events.fusion.query.AdapterConnectionClose")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<AdapterConnectionClose, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut repr__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Repr => {
+                            if repr__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("repr"));
+                            }
+                            repr__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::__SkipField__ => {
+                            let _ = map_.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AdapterConnectionClose {
+                    repr: repr__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("v1.public.events.fusion.query.AdapterConnectionClose", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for AdapterConnectionOpen {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if !self.adapter_type.is_empty() {
+            len += 1;
+        }
+        if !self.adapter_backend.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("v1.public.events.fusion.query.AdapterConnectionOpen", len)?;
+        if !self.adapter_type.is_empty() {
+            struct_ser.serialize_field("adapter_type", &self.adapter_type)?;
+        }
+        if !self.adapter_backend.is_empty() {
+            struct_ser.serialize_field("adapter_backend", &self.adapter_backend)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for AdapterConnectionOpen {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "adapter_type",
+            "adapterType",
+            "adapter_backend",
+            "adapterBackend",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            AdapterType,
+            AdapterBackend,
+            __SkipField__,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "adapterType" | "adapter_type" => Ok(GeneratedField::AdapterType),
+                            "adapterBackend" | "adapter_backend" => Ok(GeneratedField::AdapterBackend),
+                            _ => Ok(GeneratedField::__SkipField__),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = AdapterConnectionOpen;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct v1.public.events.fusion.query.AdapterConnectionOpen")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<AdapterConnectionOpen, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut adapter_type__ = None;
+                let mut adapter_backend__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::AdapterType => {
+                            if adapter_type__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("adapterType"));
+                            }
+                            adapter_type__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::AdapterBackend => {
+                            if adapter_backend__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("adapterBackend"));
+                            }
+                            adapter_backend__ = Some(map_.next_value()?);
+                        }
+                        GeneratedField::__SkipField__ => {
+                            let _ = map_.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AdapterConnectionOpen {
+                    adapter_type: adapter_type__.unwrap_or_default(),
+                    adapter_backend: adapter_backend__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("v1.public.events.fusion.query.AdapterConnectionOpen", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for ConnectionLimitWait {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.active_nodes.is_some() {
+            len += 1;
+        }
+        if self.active_connections.is_some() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("v1.public.events.fusion.query.ConnectionLimitWait", len)?;
+        if let Some(v) = self.active_nodes.as_ref() {
+            struct_ser.serialize_field("active_nodes", v)?;
+        }
+        if let Some(v) = self.active_connections.as_ref() {
+            struct_ser.serialize_field("active_connections", v)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for ConnectionLimitWait {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "active_nodes",
+            "activeNodes",
+            "active_connections",
+            "activeConnections",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            ActiveNodes,
+            ActiveConnections,
+            __SkipField__,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "activeNodes" | "active_nodes" => Ok(GeneratedField::ActiveNodes),
+                            "activeConnections" | "active_connections" => Ok(GeneratedField::ActiveConnections),
+                            _ => Ok(GeneratedField::__SkipField__),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = ConnectionLimitWait;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct v1.public.events.fusion.query.ConnectionLimitWait")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<ConnectionLimitWait, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut active_nodes__ = None;
+                let mut active_connections__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::ActiveNodes => {
+                            if active_nodes__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("activeNodes"));
+                            }
+                            active_nodes__ = 
+                                map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
+                            ;
+                        }
+                        GeneratedField::ActiveConnections => {
+                            if active_connections__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("activeConnections"));
+                            }
+                            active_connections__ = 
+                                map_.next_value::<::std::option::Option<::pbjson::private::NumberDeserialize<_>>>()?.map(|x| x.0)
+                            ;
+                        }
+                        GeneratedField::__SkipField__ => {
+                            let _ = map_.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ConnectionLimitWait {
+                    active_nodes: active_nodes__,
+                    active_connections: active_connections__,
+                })
+            }
+        }
+        deserializer.deserialize_struct("v1.public.events.fusion.query.ConnectionLimitWait", FIELDS, GeneratedVisitor)
+    }
+}
 impl serde::Serialize for QueryExecuted {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>

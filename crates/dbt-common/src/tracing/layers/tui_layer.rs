@@ -9,12 +9,13 @@ use std::{
 use crate::collections::HashSet;
 use console::Term;
 use dbt_telemetry::{
-    AnyTelemetryEvent, AssetParsed, CompiledCode, CompiledCodeInline, DepsAddPackage,
-    DepsAllPackagesInstalled, DepsPackageInstalled, ExecutionPhase, GenericOpExecuted,
-    GenericOpItemProcessed, HookProcessed, Invocation, ListItemOutput, LogMessage, LogRecordInfo,
-    NodeEvaluated, NodeOutcome, NodeProcessed, NodeSkipReason, NodeType, PhaseExecuted,
-    ProgressMessage, QueryExecuted, SeverityNumber, ShowDataOutput, ShowResult, SpanEndInfo,
-    SpanStartInfo, SpanStatus, StateModifiedDiff, StatusCode, TelemetryOutputFlags, UserLogMessage,
+    AnyTelemetryEvent, AssetParsed, CompiledCode, CompiledCodeInline, ConnectionLimitWait,
+    DepsAddPackage, DepsAllPackagesInstalled, DepsPackageInstalled, ExecutionPhase,
+    GenericOpExecuted, GenericOpItemProcessed, HookProcessed, Invocation, ListItemOutput,
+    LogMessage, LogRecordInfo, NodeEvaluated, NodeOutcome, NodeProcessed, NodeSkipReason, NodeType,
+    PhaseExecuted, ProgressMessage, QueryExecuted, SeverityNumber, ShowDataOutput, ShowResult,
+    SpanEndInfo, SpanStartInfo, SpanStatus, StateModifiedDiff, StatusCode, TelemetryOutputFlags,
+    UserLogMessage,
 };
 use dbt_tui_progress::ProgressController;
 
@@ -32,6 +33,9 @@ use crate::{
         formatters::{
             asset::format_asset_parsed_start,
             color::BLUE,
+            connection_limit_wait::{
+                format_connection_limit_wait_end, format_connection_limit_wait_start,
+            },
             constants::SELECTED_NODES_TITLE,
             deps::{
                 INSTALLING_ACTION, format_package_add_end, format_package_add_start,
@@ -155,22 +159,24 @@ struct SkippedTestNodes {
 fn emit_pending_skips(tui: &TuiLayer, data_provider: &mut DataProvider<'_>) {
     // This is a non-skipping node, check if there are pending skipped tests to emit
     let mut output_to_emit = None;
-    data_provider.with_ancestor_mut::<TuiAllProcessingNodesGroup, SkippedTestNodes>(|skipped| {
-        if !skipped.pending_names.is_empty() {
-            // Format the summary and capture it for emission after lock is released
-            output_to_emit = Some(format_skipped_test_group(
-                &skipped.pending_names,
-                skipped.seen_test,
-                skipped.seen_unit_test,
-                true,
-            ));
+    data_provider.with_ancestor_ext_mut::<TuiAllProcessingNodesGroup, SkippedTestNodes>(
+        |skipped| {
+            if !skipped.pending_names.is_empty() {
+                // Format the summary and capture it for emission after lock is released
+                output_to_emit = Some(format_skipped_test_group(
+                    &skipped.pending_names,
+                    skipped.seen_test,
+                    skipped.seen_unit_test,
+                    true,
+                ));
 
-            // Clear the pending names and flags
-            skipped.pending_names.clear();
-            skipped.seen_test = false;
-            skipped.seen_unit_test = false;
-        }
-    });
+                // Clear the pending names and flags
+                skipped.pending_names.clear();
+                skipped.seen_test = false;
+                skipped.seen_unit_test = false;
+            }
+        },
+    );
 
     // Emit the output after the span lock has been released to avoid possible deadlocks
     if let Some(output) = output_to_emit {
@@ -344,6 +350,7 @@ impl TelemetryConsumer for TuiLayer {
             // in the handler based on the verbosity level.
             && (span.attributes.is::<NodeEvaluated>()
                 || span.attributes.is::<NodeProcessed>()
+                || span.attributes.is::<ConnectionLimitWait>()
                 || span.attributes.is::<HookProcessed>()
                 || span.attributes.is::<GenericOpExecuted>()
                 || span.attributes.is::<GenericOpItemProcessed>()
@@ -395,6 +402,11 @@ impl TelemetryConsumer for TuiLayer {
             return;
         }
 
+        if let Some(wait) = span.attributes.downcast_ref::<ConnectionLimitWait>() {
+            self.handle_connection_limit_wait_start(span, wait, data_provider);
+            return;
+        }
+
         if let Some(pe) = span.attributes.downcast_ref::<PhaseExecuted>() {
             self.handle_phase_executed_start(span, pe);
             return;
@@ -436,6 +448,11 @@ impl TelemetryConsumer for TuiLayer {
         // Handle QueryExecuted events
         if let Some(query_data) = span.attributes.downcast_ref::<QueryExecuted>() {
             self.handle_query_executed(span, query_data);
+            return;
+        }
+
+        if let Some(wait) = span.attributes.downcast_ref::<ConnectionLimitWait>() {
+            self.handle_connection_limit_wait_end(span, wait, data_provider);
             return;
         }
 
@@ -785,6 +802,84 @@ impl TuiLayer {
         }
     }
 
+    fn set_node_context_idle_state(&self, data_provider: &DataProvider<'_>, idle: bool) {
+        let Some(ref progress) = self.progress else {
+            return;
+        };
+
+        let mut progress_item = None;
+        data_provider.with_ancestor_attrs::<NodeEvaluated>(|node| {
+            let phase = node.phase();
+            if matches!(
+                phase,
+                ExecutionPhase::Render | ExecutionPhase::Analyze | ExecutionPhase::Run
+            ) {
+                progress_item = Some((
+                    ProgressId::Phase(phase),
+                    format_unique_id_as_progress_item(node.unique_id.as_str()),
+                ));
+            }
+        });
+
+        if let Some((progress_id, item)) = progress_item {
+            if idle {
+                progress.set_bar_context_idle(&progress_id, &item);
+            } else {
+                progress.set_bar_context_active(&progress_id, &item);
+            }
+        }
+    }
+
+    fn handle_connection_limit_wait_start(
+        &self,
+        span: &SpanStartInfo,
+        wait: &ConnectionLimitWait,
+        data_provider: &DataProvider<'_>,
+    ) {
+        self.set_node_context_idle_state(data_provider, true);
+
+        // In interactive mode, waiting is represented by the progress context
+        // item state instead of a separate log line.
+        if self.progress.is_some() || span.severity_number > self.max_log_verbosity {
+            return;
+        }
+
+        let formatted = format_connection_limit_wait_start(wait);
+        self.write_suspended(|| {
+            io::stdout()
+                .lock()
+                .write_all(format!("{}\n", formatted).as_bytes())
+                .expect("failed to write to stdout");
+        });
+    }
+
+    fn handle_connection_limit_wait_end(
+        &self,
+        span: &SpanEndInfo,
+        wait: &ConnectionLimitWait,
+        data_provider: &DataProvider<'_>,
+    ) {
+        self.set_node_context_idle_state(data_provider, false);
+
+        // In interactive mode, waiting is represented by the progress context
+        // item state instead of a separate log line.
+        if self.progress.is_some() || span.severity_number > self.max_log_verbosity {
+            return;
+        }
+
+        let duration = span
+            .end_time_unix_nano
+            .duration_since(span.start_time_unix_nano)
+            .unwrap_or_default();
+        let formatted = format_connection_limit_wait_end(wait, duration);
+        self.write_suspended(|| {
+            io::stdout()
+                .lock()
+                .write_all(format!("{}\n", formatted).as_bytes())
+                .expect("failed to write to stdout");
+        });
+    }
+
     fn handle_node_evaluated_start(&self, span: &SpanStartInfo, ne: &NodeEvaluated) {
         // Do not emit anything for skipped node phases even in debug
         if ne.node_outcome() == NodeOutcome::Skipped {
@@ -1000,7 +1095,7 @@ impl TuiLayer {
         // In interactive non-debug mode, accumulate skipped test nodes instead of printing them individually
         if is_current_node_skipped_test && self.group_skipped_tests {
             // Find an ancestor TuiAllProcessingNodesGroup span and add this node to it
-            data_provider.with_ancestor_mut::<TuiAllProcessingNodesGroup, SkippedTestNodes>(
+            data_provider.with_ancestor_ext_mut::<TuiAllProcessingNodesGroup, SkippedTestNodes>(
                 |skipped| {
                     skipped.pending_names.push(node.name.clone());
                     if node.node_type() == NodeType::Test {

@@ -1,7 +1,8 @@
 //! Module containing the entrypoint for the resolve phase.
 use crate::args::ResolveArgs;
 use crate::dbt_project_config::{ProjectConfigResolver, RootProjectConfigs, init_project_config};
-use crate::utils::get_node_fqn;
+use crate::resolve::resolve_utils::extract_config_map;
+use crate::utils::{extract_resource_config_from_raw_project, get_node_fqn};
 use crate::validation::check_node_static_analysis;
 
 use dbt_adapter_core::AdapterType;
@@ -17,7 +18,7 @@ use dbt_schemas::schemas::common::{
     merge_meta, merge_tags, normalize_quoting,
 };
 use dbt_schemas::schemas::dbt_column::process_columns;
-use dbt_schemas::schemas::project::{DbtProject, SourceConfig};
+use dbt_schemas::schemas::project::SourceConfig;
 use dbt_schemas::schemas::properties::{SourceProperties, Tables};
 use dbt_schemas::schemas::relations::default_dbt_quoting_for;
 use dbt_schemas::schemas::serde::StringOrArrayOfStrings;
@@ -32,12 +33,158 @@ use std::sync::Arc;
 use super::resolve_properties::MinimalPropertiesEntry;
 use super::resolve_tests::persist_generic_data_tests::{TestableNodeTrait, TestableTable};
 
+fn merge_raw_time_threshold(
+    merged_freshness: &mut dbt_yaml::Mapping,
+    field: &str,
+    freshness: &dbt_yaml::Mapping,
+) {
+    let str_to_yml = |s: &str| dbt_yaml::Value::string(s.to_string());
+
+    let default_threshold = || {
+        dbt_yaml::Mapping::from_iter([
+            (str_to_yml("count"), dbt_yaml::Value::null()),
+            (str_to_yml("period"), dbt_yaml::Value::null()),
+        ])
+    };
+
+    let merge_yml = |dst: &mut dbt_yaml::Mapping, src: &dbt_yaml::Mapping| {
+        for (key, value) in src.iter() {
+            dst.insert(key.clone(), value.clone());
+        }
+    };
+
+    match (merged_freshness.get(field), freshness.get(field)) {
+        (None, None) => {
+            merged_freshness.insert(
+                str_to_yml(field),
+                dbt_yaml::Value::mapping(default_threshold()),
+            );
+        }
+        // TODO: This might be a state:modified bug in general. Core uses Python truthiness to determine
+        // whether a Time threshold is "set" — Time(count=None, period=None).__bool__() returns False,
+        // so explicit null values are treated identically to not setting the field at all, and the
+        // base value is preserved. We currently treat explicit nulls as overrides, which diverges.
+        // It does appear that explicitly setting freshness to null -- not a dict of nulls -- clears the freshness data.
+        // Reference: https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/parser/sources.py#L518-L526
+        // Carry original freshness through.
+        (Some(_), None) => (),
+        // We can always assume that the values are mappings. Fusion and Core both fail if the freshness config isn't a dict.
+        (None, Some(new)) => {
+            let mut threshold = default_threshold();
+            if let Some(new_mapping) = new.as_mapping() {
+                merge_yml(&mut threshold, new_mapping);
+            }
+            merged_freshness.insert(str_to_yml(field), dbt_yaml::Value::mapping(threshold));
+        }
+        (Some(old), Some(new)) => {
+            let mut threshold = default_threshold();
+            if let Some(old_mapping) = old.as_mapping() {
+                merge_yml(&mut threshold, old_mapping);
+            }
+            if let Some(new_mapping) = new.as_mapping() {
+                merge_yml(&mut threshold, new_mapping);
+            }
+            merged_freshness.insert(str_to_yml(field), dbt_yaml::Value::mapping(threshold));
+        }
+    };
+}
+
+fn build_source_unrendered_config(
+    fqn: &[String],
+    raw_local_project_config: &crate::utils::RawProjectConfig,
+    raw_root_project_models_cfg: Option<&crate::utils::RawProjectConfig>,
+    raw_schema_yml_config: Option<BTreeMap<String, dbt_yaml::Value>>,
+    raw_table_yml_config: Option<BTreeMap<String, dbt_yaml::Value>>,
+) -> BTreeMap<String, dbt_yaml::Value> {
+    let mut unrendered = BTreeMap::new();
+
+    // Core unconditionally pre-populates these fields before merging schema.yml config,
+    // so they always appear in unrendered_config even when not set.
+    // Reference: https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/parser/sources.py#L292
+    unrendered.insert("loaded_at_field".to_string(), dbt_yaml::Value::null());
+    unrendered.insert("loaded_at_query".to_string(), dbt_yaml::Value::null());
+
+    // Merge configs in hierarchical order: project < root < schema.config < table.config
+    // For most keys, we completely overwrite the previous value.
+    unrendered.extend(raw_local_project_config.get_config_for_fqn(fqn).clone());
+
+    if let Some(root_cfg) = raw_root_project_models_cfg {
+        unrendered.extend(root_cfg.get_config_for_fqn(fqn).clone());
+    }
+    if let Some(schema_cfg) = raw_schema_yml_config.as_ref() {
+        unrendered.extend(schema_cfg.clone());
+    }
+    if let Some(table_cfg) = raw_table_yml_config.as_ref() {
+        unrendered.extend(table_cfg.clone());
+    }
+
+    // Special precedence config: meta, tags, and freshness are merged across source and table levels,
+    // not simply overwritten. See `calculate_*_from_raw_target`.
+    // Reference: https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/parser/sources.py#L317-L322
+    let mut merged_meta = dbt_yaml::Mapping::new();
+    let mut merged_tags = std::collections::BTreeSet::new();
+    let mut merged_freshness = dbt_yaml::Mapping::new();
+    for cfg in [
+        raw_schema_yml_config.as_ref(),
+        raw_table_yml_config.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Some(meta) = cfg.get("meta").and_then(|v| v.as_mapping()) {
+            for (k, v) in meta.iter() {
+                merged_meta.insert(k.clone(), v.clone());
+            }
+        }
+        if let Some(tags) = cfg.get("tags").and_then(|v| v.as_sequence()) {
+            for t in tags {
+                if let Some(s) = t.as_str() {
+                    merged_tags.insert(s.to_string());
+                }
+            }
+        }
+        // We can't just call merge_freshness here because these are unrendered values, so
+        // we just have to hardcode the fields of the freshness definition.
+        // Reference: https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/parser/sources.py#L383
+        if let Some(freshness) = cfg.get("freshness").and_then(|v| v.as_mapping()) {
+            merge_raw_time_threshold(&mut merged_freshness, "warn_after", freshness);
+            merge_raw_time_threshold(&mut merged_freshness, "error_after", freshness);
+            // filter: last non-null wins
+            if let Some(f) = freshness.get(dbt_yaml::Value::string("filter".to_string())) {
+                if !f.is_null() {
+                    merged_freshness
+                        .insert(dbt_yaml::Value::string("filter".to_string()), f.clone());
+                }
+            } else {
+                merged_freshness.insert(
+                    dbt_yaml::Value::string("filter".to_string()),
+                    dbt_yaml::Value::null(),
+                );
+            }
+        }
+    }
+    let tags_seq = merged_tags
+        .into_iter()
+        .map(dbt_yaml::Value::string)
+        .collect::<Vec<_>>();
+    unrendered.insert("meta".to_string(), dbt_yaml::Value::mapping(merged_meta));
+    unrendered.insert("tags".to_string(), dbt_yaml::Value::sequence(tags_seq));
+    if !merged_freshness.is_empty() {
+        unrendered.insert(
+            "freshness".to_string(),
+            dbt_yaml::Value::mapping(merged_freshness),
+        );
+    }
+
+    unrendered
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn resolve_sources(
+pub async fn resolve_sources(
     arg: &ResolveArgs,
     package: &DbtPackage,
     root_package_name: &str,
-    root_project: &DbtProject,
+    root_package: &DbtPackage,
     root_project_configs: &RootProjectConfigs,
     source_properties: BTreeMap<(String, String), MinimalPropertiesEntry>,
     database: &str,
@@ -62,33 +209,57 @@ pub fn resolve_sources(
         None
     };
 
+    let is_dependency = dependency_package_name.is_some();
+    // Best-effort raw parse of the root project's `sources:` subtree, used only to hydrate
+    // dependency package nodes' `unrendered_config` with root overrides (preserving Jinja).
+    let raw_local_project_config =
+        extract_resource_config_from_raw_project(&package.raw_project_yml, "sources");
+    let raw_root_project_models_cfg = if is_dependency {
+        Some(extract_resource_config_from_raw_project(
+            &root_package.raw_project_yml,
+            "sources",
+        ))
+    } else {
+        None
+    };
+
     let special_chars = Regex::new(r"[^a-zA-Z0-9_]").unwrap();
 
     // Sources use adapter-specific quoting defaults, NOT project-level quoting
     // https://docs.getdbt.com/reference/resource-properties/quoting
     let source_default_quoting = default_dbt_quoting_for(adapter_type);
 
-    let config_resolver = ProjectConfigResolver::build(
-        root_project_configs.sources.clone(),
-        dependency_package_name.is_some(),
-        || {
+    let config_resolver =
+        ProjectConfigResolver::build(root_project_configs.sources.clone(), is_dependency, || {
             init_project_config(
                 io_args,
                 &package.dbt_project.sources,
                 source_default_quoting,
                 dependency_package_name,
             )
-        },
-    )?
-    .with_resolve_defaults((
-        arg.static_analysis.unwrap_or_default(),
-        root_project.sync.clone(),
-    ));
+        })?
+        .with_resolve_defaults((
+            arg.static_analysis.unwrap_or_default(),
+            root_package.dbt_project.sync.clone(),
+        ));
     for ((source_name, table_name), mpe) in source_properties.into_iter() {
         // Extract raw (unrendered) database and schema from the YAML before Jinja rendering.
         // These preserve Jinja templates like `{{ env_var('DBT_ENV') }}` for state comparisons.
-        let raw_source_database = mpe.schema_value.get("database").cloned();
-        let raw_source_schema = mpe.schema_value.get("schema").cloned();
+        let unrendered_database = mpe
+            .schema_value
+            .get("database")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let unrendered_schema = mpe
+            .schema_value
+            .get("schema")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
+        // Extract the rest of the raw properties YAML for merging into the unrendered config.
+        // This comes in two places: nested under each source, and nested under `tables:`
+        let raw_schema_yml_config = extract_config_map(&mpe.schema_value);
+        let raw_table_yml_config = mpe.table_value.as_ref().and_then(extract_config_map);
 
         let source: SourceProperties = into_typed_with_jinja(
             io_args,
@@ -191,6 +362,7 @@ pub fn resolve_sources(
                 })?;
                 c.loaded_at_field = Some(merged.field);
                 c.loaded_at_query = Some(merged.query).into();
+                apply_freshness_loaded_at_override(c, &source_name, &table_name)?;
                 Ok(())
             },
         )?;
@@ -298,6 +470,14 @@ pub fn resolve_sources(
 
         let static_analysis = source_config.static_analysis.clone();
 
+        let unrendered_config = build_source_unrendered_config(
+            &fqn,
+            &raw_local_project_config,
+            raw_root_project_models_cfg.as_ref(),
+            raw_schema_yml_config,
+            raw_table_yml_config,
+        );
+
         let dbt_source = DbtSource {
             __common_attr__: CommonAttributes {
                 name: table_name.to_owned(),
@@ -343,16 +523,7 @@ pub fn resolve_sources(
                 functions: vec![],
                 depends_on: NodeDependsOn::default(),
                 metrics: vec![],
-                unrendered_config: {
-                    let mut uc = BTreeMap::new();
-                    if let Some(db) = raw_source_database {
-                        uc.insert("database".to_string(), db);
-                    }
-                    if let Some(sch) = raw_source_schema {
-                        uc.insert("schema".to_string(), sch);
-                    }
-                    uc
-                },
+                unrendered_config,
             },
             __source_attr__: DbtSourceAttr {
                 freshness: match &source_config.freshness {
@@ -367,6 +538,8 @@ pub fn resolve_sources(
                 loaded_at_query: source_config.loaded_at_query.0.clone(),
                 schema_origin: source_config.schema_origin,
                 sync: source_config.sync.clone(),
+                unrendered_database,
+                unrendered_schema,
             },
             deprecated_config: source_config.clone().into(),
             __other__: other,
@@ -516,6 +689,8 @@ fn merge_freshness_unwrapped(
             // Mantle uses field-level merging: each field uses the update value if set,
             // otherwise inherits from base.
             // https://github.com/dbt-labs/dbt-mantle/blob/6bcac392d653a5c8a35da01bc94d93a45b882629/core/dbt/parser/sources.py#L545-L555
+            let update_has_loaded_at_field = update.loaded_at_field.is_some();
+            let update_has_loaded_at_query = update.loaded_at_query.is_some();
             Some(FreshnessDefinition {
                 error_after: update
                     .error_after
@@ -529,11 +704,59 @@ fn merge_freshness_unwrapped(
                     .filter
                     .clone()
                     .or_else(|| base.and_then(|b| b.filter.clone())),
+                loaded_at_field: if update_has_loaded_at_query {
+                    update.loaded_at_field.clone()
+                } else {
+                    update
+                        .loaded_at_field
+                        .clone()
+                        .or_else(|| base.and_then(|b| b.loaded_at_field.clone()))
+                },
+                loaded_at_query: if update_has_loaded_at_field {
+                    update.loaded_at_query.clone()
+                } else {
+                    update
+                        .loaded_at_query
+                        .clone()
+                        .or_else(|| base.and_then(|b| b.loaded_at_query.clone()))
+                },
             })
         }
         (Some(base), None) => Some(base.clone()),
         (None, None) => Some(FreshnessDefinition::default()), // Provide default value if user never defined freshness https://dbtlabs.atlassian.net/browse/META-5461
     }
+}
+
+fn apply_freshness_loaded_at_override(
+    config: &mut SourceConfig,
+    source_name: &str,
+    table_name: &str,
+) -> FsResult<()> {
+    if let Omissible::Present(Some(freshness)) = &config.freshness {
+        match (
+            freshness.loaded_at_field.clone(),
+            freshness.loaded_at_query.clone(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(dbt_common::fs_err!(
+                    ErrorCode::InvalidConfig,
+                    "loaded_at_field and loaded_at_query cannot be set at the same time on source `{}.{}`",
+                    source_name,
+                    table_name
+                ));
+            }
+            (Some(field), None) => {
+                config.loaded_at_field = Some(field);
+                config.loaded_at_query = Some(String::new()).into();
+            }
+            (None, Some(query)) => {
+                config.loaded_at_field = Some(String::new());
+                config.loaded_at_query = Some(query).into();
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -591,6 +814,7 @@ mod tests {
                 period: Some(FreshnessPeriod::hour),
             }),
             filter: Some("base_filter".to_string()),
+            ..Default::default()
         };
         let update = FreshnessDefinition {
             error_after: Some(FreshnessRules {
@@ -599,6 +823,7 @@ mod tests {
             }),
             warn_after: None,
             filter: None,
+            ..Default::default()
         };
 
         let result = merge_freshness_unwrapped(Some(&base), Some(&update)).unwrap();
@@ -622,6 +847,7 @@ mod tests {
                 period: Some(FreshnessPeriod::hour),
             }),
             filter: None,
+            ..Default::default()
         };
 
         let result = merge_freshness_unwrapped(Some(&base), None);
@@ -638,6 +864,7 @@ mod tests {
             }),
             warn_after: None,
             filter: None,
+            ..Default::default()
         };
 
         let result = merge_freshness_unwrapped(None, Some(&update));
@@ -661,6 +888,7 @@ mod tests {
             }),
             warn_after: None,
             filter: None,
+            ..Default::default()
         }));
 
         let update = Omissible::Present(None);
@@ -678,6 +906,7 @@ mod tests {
             }),
             warn_after: None,
             filter: None,
+            ..Default::default()
         }));
 
         let update_value = FreshnessDefinition {
@@ -690,6 +919,7 @@ mod tests {
                 period: Some(FreshnessPeriod::day),
             }),
             filter: None,
+            ..Default::default()
         };
 
         let update = Omissible::Present(Some(update_value.clone()));
@@ -707,6 +937,7 @@ mod tests {
             }),
             warn_after: None,
             filter: None,
+            ..Default::default()
         };
         let base = Omissible::Present(Some(base_value.clone()));
 
@@ -746,6 +977,7 @@ mod tests {
                 period: Some(FreshnessPeriod::hour),
             }),
             filter: Some("base_filter".to_string()),
+            ..Default::default()
         }));
 
         // Update only has error_after; warn_after and filter should be inherited from base.
@@ -756,6 +988,7 @@ mod tests {
             }),
             warn_after: None,
             filter: None,
+            ..Default::default()
         };
 
         let update = Omissible::Present(Some(update_value));
@@ -767,6 +1000,125 @@ mod tests {
         // warn_after and filter are inherited from base
         assert_eq!(merged.warn_after.as_ref().unwrap().count, Some(3));
         assert_eq!(merged.filter.as_deref(), Some("base_filter"));
+    }
+
+    #[test]
+    fn test_merge_freshness_inherits_nested_loaded_at_metadata() {
+        let base = FreshnessDefinition {
+            loaded_at_field: Some("SRC_LOADED_AT".to_string()),
+            ..Default::default()
+        };
+        let update = FreshnessDefinition {
+            warn_after: Some(FreshnessRules {
+                count: Some(3),
+                period: Some(FreshnessPeriod::hour),
+            }),
+            ..Default::default()
+        };
+
+        let result = merge_freshness_unwrapped(Some(&base), Some(&update)).unwrap();
+        assert_eq!(result.loaded_at_field.as_deref(), Some("SRC_LOADED_AT"));
+        assert_eq!(result.loaded_at_query, None);
+        assert_eq!(result.warn_after.as_ref().unwrap().count, Some(3));
+    }
+
+    #[test]
+    fn test_merge_freshness_loaded_at_query_clears_inherited_field() {
+        let base = FreshnessDefinition {
+            loaded_at_field: Some("SRC_LOADED_AT".to_string()),
+            ..Default::default()
+        };
+        let update = FreshnessDefinition {
+            loaded_at_query: Some("select max(loaded_at) from source_table".to_string()),
+            ..Default::default()
+        };
+
+        let result = merge_freshness_unwrapped(Some(&base), Some(&update)).unwrap();
+        assert_eq!(result.loaded_at_field, None);
+        assert_eq!(
+            result.loaded_at_query.as_deref(),
+            Some("select max(loaded_at) from source_table")
+        );
+    }
+
+    #[test]
+    fn test_merge_freshness_loaded_at_field_clears_inherited_query() {
+        let base = FreshnessDefinition {
+            loaded_at_query: Some("select max(loaded_at) from source_table".to_string()),
+            ..Default::default()
+        };
+        let update = FreshnessDefinition {
+            loaded_at_field: Some("TABLE_LOADED_AT".to_string()),
+            ..Default::default()
+        };
+
+        let result = merge_freshness_unwrapped(Some(&base), Some(&update)).unwrap();
+        assert_eq!(result.loaded_at_field.as_deref(), Some("TABLE_LOADED_AT"));
+        assert_eq!(result.loaded_at_query, None);
+    }
+
+    #[test]
+    fn test_freshness_loaded_at_field_overrides_top_level_query() {
+        let mut config = SourceConfig {
+            loaded_at_field: Some(String::new()),
+            loaded_at_query: Some("select max(src_loaded_at) from source_table".to_string()).into(),
+            freshness: Omissible::Present(Some(FreshnessDefinition {
+                loaded_at_field: Some("FRESHNESS_LOADED_AT".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        apply_freshness_loaded_at_override(&mut config, "src", "table").unwrap();
+
+        assert_eq!(
+            config.loaded_at_field.as_deref(),
+            Some("FRESHNESS_LOADED_AT")
+        );
+        assert_eq!(config.loaded_at_query.0.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_freshness_loaded_at_query_overrides_top_level_field() {
+        let mut config = SourceConfig {
+            loaded_at_field: Some("SRC_LOADED_AT".to_string()),
+            loaded_at_query: Some(String::new()).into(),
+            freshness: Omissible::Present(Some(FreshnessDefinition {
+                loaded_at_query: Some(
+                    "select max(freshness_loaded_at) from source_table".to_string(),
+                ),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        apply_freshness_loaded_at_override(&mut config, "src", "table").unwrap();
+
+        assert_eq!(config.loaded_at_field.as_deref(), Some(""));
+        assert_eq!(
+            config.loaded_at_query.0.as_deref(),
+            Some("select max(freshness_loaded_at) from source_table")
+        );
+    }
+
+    #[test]
+    fn test_freshness_loaded_at_field_and_query_conflict_errors() {
+        let mut config = SourceConfig {
+            freshness: Omissible::Present(Some(FreshnessDefinition {
+                loaded_at_field: Some("LOADED_AT".to_string()),
+                loaded_at_query: Some("select max(loaded_at) from source_table".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let err = apply_freshness_loaded_at_override(&mut config, "src", "table")
+            .expect_err("nested freshness peers should be mutually exclusive");
+        assert!(
+            err.to_string()
+                .contains("loaded_at_field and loaded_at_query cannot be set at the same time"),
+            "error must name the conflict; got: {err}"
+        );
     }
 
     // ── merge_loaded_at_pair ──────────────────────────────────────────────

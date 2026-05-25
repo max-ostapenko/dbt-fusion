@@ -1059,12 +1059,34 @@ fn same_database_representation_seed(self_config: &SeedConfig, other_config: &Se
 }
 
 fn same_database_representation_snapshot(
+    self_base: &NodeBaseAttributes,
+    other_base: &NodeBaseAttributes,
     self_config: &SnapshotConfig,
     other_config: &SnapshotConfig,
 ) -> bool {
-    // Compare database, schema, alias from the deprecated_config
-    /*self_config.database == other_config.database
-    && self_config.schema == other_config.schema*/
+    // dbt-core compares the unrendered config representation (database/schema/alias)
+    // to avoid treating target-derived rendering differences as modifications.
+    //
+    // If unrendered config is not available (older Fusion nodes/artifacts), fall back to the
+    // existing behavior for compatibility.
+    let self_uc = &self_base.unrendered_config;
+    let other_uc = &other_base.unrendered_config;
+
+    // Use dbt-core/Mantle semantics whenever possible: compare database/schema/alias using
+    // `unrendered_config`, treating missing keys as `None`.
+    fn get<'a>(m: &'a BTreeMap<String, YmlValue>, k: &str) -> Option<&'a str> {
+        m.get(k).and_then(|v| v.as_str())
+    }
+    let db_eq = get(self_uc, "database") == get(other_uc, "database");
+    let schema_eq = get(self_uc, "schema") == get(other_uc, "schema");
+    let alias_eq = get(self_uc, "alias") == get(other_uc, "alias");
+    let uc_eq = db_eq && schema_eq && alias_eq;
+
+    if uc_eq {
+        return true;
+    }
+
+    // Fallback: Compare rendered database/schema/alias from the deprecated_config (Fusion legacy behavior).
     let alias_eq = self_config.alias == other_config.alias;
 
     if !alias_eq {
@@ -2624,6 +2646,8 @@ impl InternalDbtNode for DbtSnapshot {
             );
             let same_fqn_result = same_fqn(&self.__common_attr__, &other_snapshot.__common_attr__);
             let same_db_repr_result = same_database_representation_snapshot(
+                &self.__base_attr__,
+                &other_snapshot.__base_attr__,
                 &self.deprecated_config,
                 &other_snapshot.deprecated_config,
             );
@@ -2723,14 +2747,17 @@ impl InternalDbtNodeAttributes for DbtSnapshot {
         let mut value =
             dbt_yaml::to_value(&self.deprecated_config).expect("Failed to serialize to YAML");
 
-        // Snapshot macros read `snapshot_table_column_names` (legacy key), but users write
-        // `snapshot_meta_column_names`. Normalize here so both compile and run see the legacy key.
         if let YmlValue::Mapping(ref mut map, _) = value {
-            if !map.contains_key("snapshot_table_column_names") {
-                if let Some(v) = map.get("snapshot_meta_column_names").cloned() {
-                    if !v.is_null() {
-                        map.insert("snapshot_table_column_names".into(), v);
-                    }
+            let has_meta_column_names =
+                matches!(map.get("snapshot_meta_column_names"), Some(v) if !v.is_null());
+            if has_meta_column_names {
+                let column_names = self
+                    .__snapshot_attr__
+                    .snapshot_meta_column_names
+                    .to_defaulted_column_names();
+                map.insert("snapshot_meta_column_names".into(), column_names.clone());
+                if !map.contains_key("snapshot_table_column_names") {
+                    map.insert("snapshot_table_column_names".into(), column_names);
                 }
             }
         }
@@ -4786,6 +4813,9 @@ pub struct DbtSourceAttr {
     #[serde(default)]
     pub schema_origin: SchemaOrigin,
     pub sync: Option<SyncConfig>,
+    /// Reference: https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/artifacts/resources/v1/source_definition.py#L85-L86
+    pub unrendered_database: Option<String>,
+    pub unrendered_schema: Option<String>,
 }
 
 impl DbtSource {
@@ -5272,6 +5302,7 @@ impl AdapterAttr {
                     query_tag: config.query_tag.clone(),
                     automatic_clustering: config.automatic_clustering,
                     copy_grants: config.copy_grants,
+                    copy_tags: config.copy_tags,
                     secure: config.secure,
                     transient: config.transient,
                 })))
@@ -5376,6 +5407,7 @@ impl AdapterAttr {
                         query_tag: config.query_tag.clone(),
                         automatic_clustering: config.automatic_clustering,
                         copy_grants: config.copy_grants,
+                        copy_tags: config.copy_tags,
                         secure: config.secure,
                         transient: config.transient,
                     })))
@@ -5477,6 +5509,7 @@ pub struct SnowflakeAttr {
     pub query_tag: Option<QueryTag>,
     pub automatic_clustering: Option<bool>,
     pub copy_grants: Option<bool>,
+    pub copy_tags: Option<bool>,
     pub secure: Option<bool>,
     pub transient: Option<bool>,
 }
@@ -5568,6 +5601,7 @@ pub struct DbtModelAttr {
     pub contract: Option<DbtContract>,
     pub incremental_strategy: Option<DbtIncrementalStrategy>,
     pub freshness: Option<ModelFreshness>,
+    pub state: Option<crate::schemas::properties::ModelState>,
     pub version: Option<StringOrInteger>,
     pub latest_version: Option<StringOrInteger>,
     pub constraints: Vec<ModelConstraint>,
@@ -5634,13 +5668,60 @@ mod tests {
     use serde::Deserialize;
 
     use super::{
-        ModelConfig, hooks_equal, normalize_description, persist_docs_configs_equal, quoting_equal,
+        DbtSnapshot, InternalDbtNodeAttributes, ModelConfig, hooks_equal, normalize_description,
+        persist_docs_configs_equal, quoting_equal,
     };
     use crate::schemas::common::{Hooks, PersistDocsConfig};
+    use crate::schemas::project::SnapshotMetaColumnNames;
     use dbt_adapter_core::AdapterType;
     use dbt_yaml::Verbatim;
 
     type YmlValue = dbt_yaml::Value;
+
+    #[test]
+    fn snapshot_serialized_config_defaults_partial_meta_column_names() {
+        let meta_column_names = SnapshotMetaColumnNames {
+            dbt_valid_from: Some("snapshot_valid_from_custom".to_string()),
+            dbt_valid_to: Some("snapshot_valid_to_custom".to_string()),
+            ..Default::default()
+        };
+
+        let mut snapshot = DbtSnapshot::default();
+        snapshot.deprecated_config.snapshot_meta_column_names = Some(meta_column_names.clone());
+        snapshot.__snapshot_attr__.snapshot_meta_column_names = meta_column_names;
+
+        let config = snapshot.serialized_config();
+        let YmlValue::Mapping(config, _) = config else {
+            panic!("expected serialized snapshot config to be a map");
+        };
+        let meta = config
+            .get("snapshot_meta_column_names")
+            .expect("snapshot_meta_column_names should be present");
+        let legacy = config
+            .get("snapshot_table_column_names")
+            .expect("snapshot_table_column_names should be present");
+        assert_eq!(meta, legacy);
+
+        let YmlValue::Mapping(meta, _) = meta else {
+            panic!("expected snapshot_meta_column_names to be a map");
+        };
+        assert_eq!(
+            meta.get("dbt_scd_id").and_then(|v| v.as_str()),
+            Some("dbt_scd_id")
+        );
+        assert_eq!(
+            meta.get("dbt_valid_from").and_then(|v| v.as_str()),
+            Some("snapshot_valid_from_custom")
+        );
+        assert_eq!(
+            meta.get("dbt_valid_to").and_then(|v| v.as_str()),
+            Some("snapshot_valid_to_custom")
+        );
+        assert_eq!(
+            meta.get("dbt_is_deleted").and_then(|v| v.as_str()),
+            Some("dbt_is_deleted")
+        );
+    }
 
     #[test]
     fn test_hooks_equal_none_vs_empty_array() {

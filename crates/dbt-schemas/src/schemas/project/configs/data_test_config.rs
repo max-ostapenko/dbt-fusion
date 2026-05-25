@@ -121,6 +121,12 @@ pub struct ProjectDataTestConfig {
         deserialize_with = "bool_or_string_bool"
     )]
     pub copy_grants: Option<bool>,
+    #[serde(
+        default,
+        rename = "+copy_tags",
+        deserialize_with = "bool_or_string_bool"
+    )]
+    pub copy_tags: Option<bool>,
     #[serde(default, rename = "+secure", deserialize_with = "bool_or_string_bool")]
     pub secure: Option<bool>,
     #[serde(
@@ -328,6 +334,7 @@ pub struct DataTestConfig {
     pub limit: Option<i32>,
     #[serde(serialize_with = "crate::schemas::serde::serialize_option_as_empty_map")]
     pub meta: Option<IndexMap<String, YmlValue>>,
+    #[resolved(promote, default = Severity::Error)]
     pub severity: Option<Severity>,
     #[serde(default, deserialize_with = "bool_or_string_bool")]
     pub store_failures: Option<bool>,
@@ -401,6 +408,7 @@ impl From<ProjectDataTestConfig> for DataTestConfig {
                 row_access_policy: config.row_access_policy,
                 automatic_clustering: config.automatic_clustering,
                 copy_grants: config.copy_grants,
+                copy_tags: config.copy_tags,
                 secure: config.secure,
                 transient: config.transient,
                 iceberg_version: None,
@@ -519,6 +527,7 @@ impl From<DataTestConfig> for ProjectDataTestConfig {
             row_access_policy: config.__warehouse_specific_config__.row_access_policy,
             automatic_clustering: config.__warehouse_specific_config__.automatic_clustering,
             copy_grants: config.__warehouse_specific_config__.copy_grants,
+            copy_tags: config.__warehouse_specific_config__.copy_tags,
             secure: config.__warehouse_specific_config__.secure,
             transient: config.__warehouse_specific_config__.transient,
             // BigQuery fields
@@ -622,6 +631,21 @@ impl ResolvableConfig<DataTestConfig> for DataTestConfig {
         }
         if store_failures && self.store_failures.is_none() {
             self.store_failures = Some(store_failures);
+        }
+        // Mirror dbt-core's TestConfig.finalize_and_validate: cross-fill store_failures_as
+        // from store_failures so the manifest carries a concrete value matching core.
+        // See core/dbt/artifacts/resources/v1/config.py:195-241.
+        if self.store_failures_as.is_none() {
+            self.store_failures_as = match self.store_failures {
+                Some(true) => Some(StoreFailuresAs::Table),
+                Some(false) => Some(StoreFailuresAs::Ephemeral),
+                None => None,
+            };
+        } else if self.store_failures.is_none() {
+            self.store_failures = Some(matches!(
+                self.store_failures_as,
+                Some(StoreFailuresAs::Table) | Some(StoreFailuresAs::View)
+            ));
         }
     }
 

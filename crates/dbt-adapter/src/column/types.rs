@@ -143,8 +143,8 @@ impl ColumnStatic {
             args,
         );
 
-        let name = iter.next_arg::<&str>()?;
-        let dtype = iter.next_arg::<&str>()?;
+        let name = iter.next_pos_arg_aliased::<&str>(&["column"])?;
+        let dtype = iter.next_pos_arg_aliased::<&str>(&["dtype"])?;
 
         let char_size = iter.next_arg::<Option<u32>>().unwrap_or(None);
         let numeric_precision = iter.next_arg::<Option<u64>>().unwrap_or(None);
@@ -258,6 +258,10 @@ impl ColumnStatic {
             AdapterType::Bigquery => match size {
                 Some(size) => format!("STRING({size})"),
                 _ => "STRING".to_string(),
+            },
+            AdapterType::ClickHouse => match size {
+                Some(size) => format!("FixedString({size})"),
+                _ => "String".to_string(),
             },
             _ => match size {
                 Some(size) => format!("character varying({size})"),
@@ -933,8 +937,11 @@ impl Column {
 
     fn is_string(&self) -> bool {
         match self._adapter_type {
-            AdapterType::Bigquery => {
-                matches!(self.core_dtype.to_lowercase().as_str(), "string")
+            AdapterType::Bigquery | AdapterType::ClickHouse => {
+                matches!(
+                    self.core_dtype.to_lowercase().as_str(),
+                    "string" | "fixedstring"
+                )
             }
             _ => {
                 matches!(

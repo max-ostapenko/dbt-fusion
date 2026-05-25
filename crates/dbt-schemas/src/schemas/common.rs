@@ -241,6 +241,10 @@ pub struct FreshnessDefinition {
     pub warn_after: Option<FreshnessRules>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loaded_at_field: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loaded_at_query: Option<String>,
 }
 
 /// Custom serializer to ensure FreshnessRules are always objects, never null
@@ -686,6 +690,9 @@ pub enum DbtIncrementalStrategy {
     /// replace_where (Databricks only)
     /// see https://docs.getdbt.com/reference/resource-configs/databricks-configs
     ReplaceWhere,
+    /// legacy (ClickHouse only) — intermediate-table + swap approach
+    /// https://github.com/ClickHouse/dbt-clickhouse/blob/main/dbt/adapters/clickhouse/impl.py
+    Legacy,
     #[strum(default)]
     #[serde(untagged)]
     Custom(String),
@@ -1213,13 +1220,14 @@ pub enum StoreFailuresAs {
 }
 
 #[derive(Debug, Serialize, Default, Deserialize, Clone, EnumString, Display, DbtSchema)]
+#[serde(rename_all = "UPPERCASE")]
 #[schemars(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Severity {
     #[default]
-    #[serde(alias = "error", alias = "ERROR")]
+    #[serde(alias = "error", alias = "Error")]
     Error,
-    #[serde(alias = "warn", alias = "WARN")]
+    #[serde(alias = "warn", alias = "Warn")]
     Warn,
 }
 

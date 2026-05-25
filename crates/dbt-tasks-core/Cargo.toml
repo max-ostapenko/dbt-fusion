@@ -13,8 +13,11 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 dbt-adapter = { workspace = true }
 dbt-adapter-core = { workspace = true }
+dbt-adapter-sql = { workspace = true }
+dbt-cloud-config = { workspace = true }
 dbt-common = { workspace = true }
 dbt-dag = { workspace = true }
 dbt-fusion-workspace-hack = { version = "0.1" }
@@ -34,7 +37,6 @@ petgraph = { workspace = true }
 regex = { workspace = true }
 scc = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
