@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Display};
 
 use dbt_proc_macros::include_frontend_error_codes;
 use int_enum::IntEnum;
-use strum_macros::EnumString;
+use strum_macros::{EnumString, IntoStaticStr};
 
 /// Error codes for the SDF CLI.
 ///
@@ -12,7 +12,7 @@ use strum_macros::EnumString;
 #[include_frontend_error_codes]
 #[repr(u16)]
 #[non_exhaustive]
-#[derive(Debug, Copy, Clone, Eq, PartialEq, IntEnum, EnumString, Default)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, IntEnum, EnumString, IntoStaticStr, Default)]
 pub enum ErrorCode {
     // ----------------- Frontend errors [0, 999] -----------------------------
     //
@@ -209,9 +209,9 @@ pub enum ErrorCode {
     SidecarError = 1406,
     NoResultsToShow = 1407,
     SidecarUnsupportedFeature = 1408,
-    /// Run-cache service degraded into fail-open: config/init/decision/cache
+    /// dbt State service degraded into fail-open: config/init/decision/cache
     /// errors that don't abort the command but indicate degraded behavior.
-    RunCacheServiceWarn = 1410,
+    StateServiceWarn = 1410,
 
     // Serialization [1450–1460]
     JsonInvalid = 1450,
@@ -307,8 +307,12 @@ impl Display for ErrorCode {
 }
 
 impl ErrorCode {
+    pub fn name(self) -> &'static str {
+        self.into()
+    }
+
     pub fn name_and_code(self) -> String {
-        format!("{self:?} (dbt{self})")
+        format!("{} (dbt{self})", self.name())
     }
 
     pub fn is_bug(&self) -> bool {
@@ -406,5 +410,18 @@ impl Default for Warnings {
     /// Creates a new Warnings instance with an empty hashmap.
     fn default() -> Self {
         Warnings::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ErrorCode;
+
+    #[test]
+    fn state_service_warn_renders_name_and_code() {
+        assert_eq!(
+            ErrorCode::StateServiceWarn.name_and_code(),
+            "StateServiceWarn (dbt1410)"
+        );
     }
 }

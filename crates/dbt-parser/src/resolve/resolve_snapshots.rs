@@ -209,15 +209,9 @@ pub async fn resolve_snapshots(
 
                 // Preserve directory structure from the properties file path
                 // This ensures FQN includes directory components for proper selector matching
-                let default_snapshots_path = vec![DBT_SNAPSHOTS_DIR_NAME.to_string()];
-                let original_relative_path = strip_resource_paths_from_ref_path(
-                    &mpe.relative_path,
-                    package
-                        .dbt_project
-                        .snapshot_paths
-                        .as_ref()
-                        .unwrap_or(&default_snapshots_path),
-                );
+                let resource_paths: Vec<String> = package.dbt_project.all_source_paths().clone();
+                let original_relative_path =
+                    strip_resource_paths_from_ref_path(&mpe.relative_path, &resource_paths);
                 let target_path = PathBuf::from(DBT_SNAPSHOTS_DIR_NAME)
                     .join(
                         original_relative_path
@@ -322,6 +316,7 @@ pub async fn resolve_snapshots(
         asset: dbt_asset,
         sql_file_info,
         config: snapshot_config,
+        raw_code,
         macro_spans: _macro_spans,
         properties: maybe_properties,
         status,
@@ -389,14 +384,24 @@ pub async fn resolve_snapshots(
                 .into_iter()
                 .collect();
 
-            let raw_inline_config =
+            // For block-style snapshots (`{% snapshot foo %}...{% endsnapshot %}`),
+            // fs rewrites the on-disk file to a stub macro call `{{ snapshot_foo() }}`
+            // and renders that as raw_code. dbt-core writes the verbatim body between
+            // the snapshot tags into raw_code instead (its same_body/state:modified
+            // selectors depend on this). Re-read the original file here and extract
+            // both the unrendered inline config and the snapshot block body in one go.
+            let (raw_inline_config, snapshot_block_body) =
                 if let Some(original_path) = snapshot_original_paths.get(&dbt_asset.path) {
-                    tokiofs::read_to_string(original_path)
-                        .await
-                        .ok()
-                        .and_then(|sql| parse_unrendered_config(&sql, true))
+                    match tokiofs::read_to_string(original_path).await {
+                        Ok(sql) => {
+                            let body = extract_snapshot_block_body(&sql);
+                            let cfg = parse_unrendered_config(&sql, true);
+                            (cfg, body)
+                        }
+                        Err(_) => (None, None),
+                    }
                 } else {
-                    None
+                    (None, None)
                 };
 
             let unrendered_config = build_unrendered_config(
@@ -415,15 +420,13 @@ pub async fn resolve_snapshots(
                     package_name: package_name.clone(),
                     path: dbt_asset.path.clone(),
                     name_span: dbt_common::Span::default(),
-                    // NOTE: raw_code has to be this value for dbt-evaluator to return truthy
-                    // hydrating it with get_original_file_contents would actually break dbt-evaluator
-                    raw_code: Some("--placeholder--".to_string()),
+                    raw_code: Some(snapshot_block_body.unwrap_or(raw_code)),
                     // The original file path where the snapshot was defined
                     // For package snapshots, this includes the package path (e.g., dbt_packages/my_pkg/snapshots/foo.sql)
                     original_file_path: dbt_asset.original_path.clone(),
                     unique_id: unique_id.clone(),
                     fqn,
-                    description: properties.description.to_owned(),
+                    description: Some(properties.description.clone().unwrap_or_default()),
                     patch_path: patch_path.clone(),
                     checksum: recalculated_checksum,
                     language: Some("sql".to_string()),
@@ -624,6 +627,43 @@ pub async fn resolve_snapshots(
     );
 
     Ok((snapshots, disabled_snapshots))
+}
+
+/// Extract the verbatim body between `{% snapshot ... %}` and `{% endsnapshot %}`
+/// tags. Returns None if the input is not a block-style snapshot.
+///
+/// dbt-core's snapshot parser uses the body (not the wrapping tags) as `raw_code`;
+/// fs needs to match so that `state:modified.body`, partial-parse hashing, and
+/// `{{ this }}` ref scans against fs-produced manifests behave identically.
+fn extract_snapshot_block_body(sql: &str) -> Option<String> {
+    static SNAPSHOT_OPEN_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\{%(-?)\s*snapshot\s+\w+\s*(-?)%\}").unwrap()
+    });
+    static SNAPSHOT_CLOSE_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\{%(-?)\s*endsnapshot\s*(-?)%\}").unwrap());
+
+    let open = SNAPSHOT_OPEN_RE.captures(sql)?;
+    let open_full = open.get(0).unwrap();
+    let body_start = open_full.end();
+    let open_trail_dash = !open.get(2).unwrap().as_str().is_empty();
+
+    let close = SNAPSHOT_CLOSE_RE
+        .captures_iter(sql)
+        .filter(|c| c.get(0).unwrap().start() >= body_start)
+        .last()?;
+    let close_full = close.get(0).unwrap();
+    let close_lead_dash = !close.get(1).unwrap().as_str().is_empty();
+
+    let mut body = &sql[body_start..close_full.start()];
+    // Honor Jinja whitespace control: `-%}` on the opening tag and `{%-` on the
+    // closing tag strip adjacent whitespace inside the block.
+    if open_trail_dash {
+        body = body.trim_start();
+    }
+    if close_lead_dash {
+        body = body.trim_end();
+    }
+    Some(body.to_string())
 }
 
 async fn recalculate_snapshot_checksum(

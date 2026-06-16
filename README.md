@@ -1,3 +1,15 @@
+> [!IMPORTANT]
+> ## 📦 Issue tracking has moved to dbt-core
+>
+> Issues and bug reports for the **dbt Fusion engine** are now tracked in **[dbt-labs/dbt-core](https://github.com/dbt-labs/dbt-core)**, alongside the rest of dbt.
+>
+> - 🐞 **File new issues** in [dbt-labs/dbt-core](https://github.com/dbt-labs/dbt-core/issues/new/choose)
+> - 📖 Fusion docs: https://docs.getdbt.com/docs/fusion
+>
+> Existing issues have been transferred to dbt-core — old issue links redirect automatically.
+
+---
+
 <div style="text-align: center;">
   <img src="assets/dbt-fusion-engine.png" alt="dbt Fusion Engine" width="400" style="border-radius: 6px;" />
 </div>

@@ -21,8 +21,8 @@
 //! - Incremental (`changed_nodes = Some(set)`): write a new `nodes/N.parquet`
 //!   with only the changed rows.
 //! - Read: collect all epoch files in order, latest epoch wins by `unique_id`.
-//! - Compact: when epoch count > `COMPACT_THRESHOLD`, merge all into `nodes/0.parquet`
-//!   and delete the rest.
+//! - Compact: when delta row count > 10% of alive nodes OR file count > 8,
+//!   merge all into `nodes/0.parquet` and delete the rest.
 //!
 //! # Liveness invariant
 //!
@@ -65,11 +65,12 @@ use dbt_schemas::{
     schemas::{
         DbtAnalysis, DbtExposure, DbtFunction, DbtModel, DbtSeed, DbtSnapshot, DbtSource, DbtTest,
         DbtUnitTest, Nodes,
+        common::ConstraintType,
         macros::{DbtDocsMacro, DbtMacro, MacroArgument},
         manifest::{DbtMetric, DbtSavedQuery, DbtSemanticModel},
         nodes::DbtGroup,
     },
-    state::{DbtPackage, Macros, ResourcePathKind},
+    state::{DbtPackage, Macros, ManifestPathConfig, ResourcePathKind},
 };
 
 use crate::partial_parse::PackageSnapshot;
@@ -77,9 +78,6 @@ use crate::partial_parse::PackageSnapshot;
 // ── constants ─────────────────────────────────────────────────────────────────
 
 pub const CACHE_DIR_NAME: &str = "metadata/parse";
-
-/// Compact epoch files into one when this many delta files exist.
-const COMPACT_THRESHOLD: u32 = 8;
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -89,8 +87,15 @@ pub fn cache_dir(out_dir: &Path) -> PathBuf {
     out_dir.join(CACHE_DIR_NAME)
 }
 
-pub(crate) fn project_path(dir: &Path) -> PathBuf {
-    dir.join("project.parquet")
+/// Path to the generation token: written only on cold start (changed_nodes == None).
+/// Its `ingested_at` is the timestamp of the last cold start; compile rows are stale
+/// when their `ingested_at` is older than this value.
+pub fn generation_path(dir: &Path) -> PathBuf {
+    dir.join("generation.parquet")
+}
+
+pub(crate) fn resolver_state_path(dir: &Path) -> PathBuf {
+    dir.join("resolver_state.parquet")
 }
 
 fn filestamps_path(dir: &Path) -> PathBuf {
@@ -137,10 +142,49 @@ pub(crate) fn system_time_to_nanos(t: SystemTime) -> u64 {
 
 // ── row types (Serialize + Deserialize → serde_arrow) ────────────────────────
 
-#[derive(Serialize, Deserialize, Clone)]
-pub(crate) struct KvRow {
-    pub key: String,
-    pub value: String,
+/// Single-row record written only on cold start. Its `ingested_at` is the timestamp
+/// of the last cold start; compile rows with an older `ingested_at` are stale.
+/// The other fields record what triggered the cold start — they don't change between
+/// cold starts, so dbt-index ignores them and reads only `ingested_at`.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct GenerationRow {
+    pub ingested_at: i64,
+    pub version: String,
+    pub dbt_version: String,
+    pub project_name: String,
+    pub adapter_type: String,
+    pub vars_json: String,
+    pub env_vars_json: String,
+    pub profile_hash: String,
+    pub profile_file_hash: String,
+    pub project_file_hash: String,
+    pub cli_vars_hash: String,
+    pub packages_lock_hash: String,
+}
+
+/// Single-row record written every parse (cold and incremental). Contains resolver
+/// output — data that may change on any parse, not just cold starts.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct ResolverStateRow {
+    pub ingested_at: i64,
+    pub dbt_profile_json: String,
+    pub vars_json: String,
+    pub env_vars_json: String,
+    pub get_relation_calls_json: String,
+    pub get_columns_in_relation_calls_json: String,
+    pub patterned_dangling_sources_json: String,
+    pub nodes_with_resolution_errors_json: String,
+    pub nodes_with_access_errors_json: String,
+    pub operations_json: String,
+    pub selectors_json: String,
+    pub git_sha: String,
+    pub git_branch: String,
+    pub git_is_dirty: i32,
+    pub pkg_deps_json: String,
+    pub pkg_kinds_json: String,
+    #[serde(default)]
+    pub pkg_manifest_path_configs_json: String,
+    pub any_uses_graph: i32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -237,8 +281,44 @@ fn read_rows<T: serde::de::DeserializeOwned>(path: &Path) -> Vec<T> {
     dbt_metadata_parquet::epoch_io::read_rows(path)
 }
 
-fn kv_fields() -> Vec<FieldRef> {
-    vec![str_field("key"), str_field("value")]
+fn generation_fields() -> Vec<FieldRef> {
+    vec![
+        timestamp_micros_field("ingested_at"),
+        str_field("version"),
+        str_field("dbt_version"),
+        str_field("project_name"),
+        str_field("adapter_type"),
+        str_field("vars_json"),
+        str_field("env_vars_json"),
+        str_field("profile_hash"),
+        str_field("profile_file_hash"),
+        str_field("project_file_hash"),
+        str_field("cli_vars_hash"),
+        str_field("packages_lock_hash"),
+    ]
+}
+
+fn resolver_state_fields() -> Vec<FieldRef> {
+    vec![
+        timestamp_micros_field("ingested_at"),
+        str_field("dbt_profile_json"),
+        str_field("vars_json"),
+        str_field("env_vars_json"),
+        str_field("get_relation_calls_json"),
+        str_field("get_columns_in_relation_calls_json"),
+        str_field("patterned_dangling_sources_json"),
+        str_field("nodes_with_resolution_errors_json"),
+        str_field("nodes_with_access_errors_json"),
+        str_field("operations_json"),
+        str_field("selectors_json"),
+        str_field("git_sha"),
+        str_field("git_branch"),
+        i32_field("git_is_dirty"),
+        str_field("pkg_deps_json"),
+        str_field("pkg_kinds_json"),
+        str_field("pkg_manifest_path_configs_json"),
+        i32_field("any_uses_graph"),
+    ]
 }
 
 fn filestamp_fields() -> Vec<FieldRef> {
@@ -709,10 +789,14 @@ pub struct SaveArgs<'a> {
     pub out_dir: &'a Path,
     pub version: u32,
     pub dbt_version: &'a str,
+    pub project_name: &'a str,
+    pub adapter_type: &'a str,
     pub profile_hash: &'a str,
     pub profile_file_hash: &'a str,
     pub project_file_hash: &'a str,
     pub cli_vars_hash: &'a str,
+    /// blake3 hash of `package-lock.yml`. Empty string when no lock file exists.
+    pub packages_lock_hash: &'a str,
     pub dbt_profile_json: &'a str,
     pub vars_json: &'a str,
     pub env_vars_json: &'a str,
@@ -734,6 +818,151 @@ pub struct SaveArgs<'a> {
     pub git_is_dirty: bool,
 }
 
+// ── SaveArgs default (for tests) ─────────────────────────────────────────────
+
+static EMPTY_NODES: std::sync::OnceLock<Nodes> = std::sync::OnceLock::new();
+static EMPTY_MACROS: std::sync::OnceLock<Macros> = std::sync::OnceLock::new();
+
+impl<'a> SaveArgs<'a> {
+    /// Returns a `SaveArgs` with all fields set to safe empty/zero defaults.
+    /// Use with struct-update syntax in tests: `SaveArgs { version: 9999, ..SaveArgs::test_default(out_dir) }`.
+    pub fn test_default(out_dir: &'a Path) -> Self {
+        SaveArgs {
+            out_dir,
+            version: 0,
+            dbt_version: "",
+            project_name: "",
+            adapter_type: "",
+            profile_hash: "",
+            profile_file_hash: "",
+            project_file_hash: "",
+            cli_vars_hash: "",
+            packages_lock_hash: "",
+            dbt_profile_json: "{}",
+            vars_json: "{}",
+            env_vars_json: "{}",
+            get_relation_calls_json: "{}",
+            get_columns_in_relation_calls_json: "{}",
+            patterned_dangling_sources_json: "{}",
+            nodes_with_resolution_errors_json: "[]",
+            nodes_with_access_errors_json: "[]",
+            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
+            selectors_json: "",
+            git_sha: "",
+            git_branch: "",
+            git_is_dirty: false,
+            packages: &[],
+            nodes: EMPTY_NODES.get_or_init(Nodes::default),
+            disabled_nodes: EMPTY_NODES.get_or_init(Nodes::default),
+            macros: EMPTY_MACROS.get_or_init(Macros::default),
+            changed_nodes: None,
+            ingested_at: 0,
+        }
+    }
+}
+
+fn push_column_rows(
+    uid: &str,
+    cols: &[Arc<dbt_schemas::schemas::dbt_column::DbtColumn>],
+    ingested_at: i64,
+    rows: &mut Vec<dbt_metadata_parquet::parse_columns::ParseColumnRow>,
+) {
+    use dbt_metadata_parquet::parse_columns::ParseColumnRow;
+    for col in cols {
+        let is_primary_key = col
+            .constraints
+            .iter()
+            .any(|c| matches!(c.type_, ConstraintType::PrimaryKey));
+        rows.push(ParseColumnRow {
+            unique_id: uid.to_string(),
+            column_name: col.name.clone(),
+            description: col.description.clone(),
+            declared_type: col.data_type.clone(),
+            is_primary_key,
+            constraints: if col.constraints.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&col.constraints).ok()
+            },
+            meta: if col.meta.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&col.meta).ok()
+            },
+            tags: col.tags.clone(),
+            granularity: None,
+            ingested_at,
+        });
+    }
+}
+
+fn collect_parse_column_rows(
+    nodes: &Nodes,
+    changed_nodes: Option<&HashSet<String>>,
+    ingested_at: i64,
+) -> Vec<dbt_metadata_parquet::parse_columns::ParseColumnRow> {
+    let mut rows = Vec::new();
+    for (uid, model) in &nodes.models {
+        if changed_nodes.is_some_and(|s| !s.contains(uid.as_str())) {
+            continue;
+        }
+        push_column_rows(uid, &model.__base_attr__.columns, ingested_at, &mut rows);
+    }
+    for (uid, src) in &nodes.sources {
+        if changed_nodes.is_some_and(|s| !s.contains(uid.as_str())) {
+            continue;
+        }
+        push_column_rows(uid, &src.__base_attr__.columns, ingested_at, &mut rows);
+    }
+    rows
+}
+
+fn collect_parse_test_metadata_rows(
+    nodes: &Nodes,
+    changed_nodes: Option<&HashSet<String>>,
+    ingested_at: i64,
+) -> Vec<dbt_metadata_parquet::parse_test_metadata::ParseTestMetadataRow> {
+    use dbt_metadata_parquet::parse_test_metadata::ParseTestMetadataRow;
+    let mut rows = Vec::new();
+
+    for (uid, test) in &nodes.tests {
+        if changed_nodes.is_some_and(|s| !s.contains(uid.as_str())) {
+            continue;
+        }
+        if let Some(tm) = &test.__test_attr__.test_metadata {
+            let severity = test
+                .deprecated_config
+                .severity
+                .as_ref()
+                .and_then(|v| serde_json::to_value(v).ok())
+                .and_then(|v| v.as_str().map(String::from));
+            rows.push(ParseTestMetadataRow {
+                unique_id: uid.clone(),
+                test_name: Some(tm.name.clone()),
+                test_namespace: tm.namespace.clone(),
+                kwargs: serde_json::to_string(&tm.kwargs)
+                    .ok()
+                    .filter(|s| s != "null"),
+                column_name: test.__test_attr__.column_name.clone(),
+                attached_node: test.__test_attr__.attached_node.clone(),
+                severity,
+                warn_if: test.deprecated_config.warn_if.clone(),
+                error_if: test.deprecated_config.error_if.clone(),
+                fail_calc: test.deprecated_config.fail_calc.clone(),
+                store_failures: test.deprecated_config.store_failures,
+                store_failures_as: test
+                    .deprecated_config
+                    .store_failures_as
+                    .as_ref()
+                    .and_then(|v| serde_json::to_value(v).ok())
+                    .and_then(|v| v.as_str().map(String::from)),
+                ingested_at,
+            });
+        }
+    }
+    rows
+}
+
 pub fn save(args: &SaveArgs<'_>) -> Result<(), String> {
     // Nothing changed — skip all I/O.
     if let Some(set) = args.changed_nodes {
@@ -750,7 +979,10 @@ pub fn save(args: &SaveArgs<'_>) -> Result<(), String> {
     let mut filestamp_rows: Vec<FilestampRow> = Vec::new();
     let mut pkg_deps_map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut pkg_kinds_map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut pkg_manifest_path_configs: BTreeMap<String, ManifestPathConfig> = BTreeMap::new();
     for pkg in args.packages {
+        pkg_manifest_path_configs
+            .insert(pkg.package_name.clone(), pkg.manifest_path_config.clone());
         for dep in &pkg.dependencies {
             pkg_deps_map
                 .entry(pkg.package_name.clone())
@@ -786,61 +1018,10 @@ pub fn save(args: &SaveArgs<'_>) -> Result<(), String> {
         tfs,
     );
 
-    // ── project (includes pkg_deps_json and pkg_kinds_json) ──────────────────
     let pkg_deps_json = serde_json::to_string(&pkg_deps_map).unwrap_or_else(|_| "{}".into());
     let pkg_kinds_json = serde_json::to_string(&pkg_kinds_map).unwrap_or_else(|_| "{}".into());
-    let kv_rows: Vec<KvRow> = vec![
-        ("version", args.version.to_string()),
-        ("dbt_version", args.dbt_version.to_string()),
-        ("profile_hash", args.profile_hash.to_string()),
-        ("profile_file_hash", args.profile_file_hash.to_string()),
-        ("project_file_hash", args.project_file_hash.to_string()),
-        ("cli_vars_hash", args.cli_vars_hash.to_string()),
-        ("dbt_profile_json", args.dbt_profile_json.to_string()),
-        ("vars_json", args.vars_json.to_string()),
-        ("env_vars_json", args.env_vars_json.to_string()),
-        (
-            "get_relation_calls_json",
-            args.get_relation_calls_json.to_string(),
-        ),
-        (
-            "get_columns_in_relation_calls_json",
-            args.get_columns_in_relation_calls_json.to_string(),
-        ),
-        (
-            "patterned_dangling_sources_json",
-            args.patterned_dangling_sources_json.to_string(),
-        ),
-        (
-            "nodes_with_resolution_errors_json",
-            args.nodes_with_resolution_errors_json.to_string(),
-        ),
-        (
-            "nodes_with_access_errors_json",
-            args.nodes_with_access_errors_json.to_string(),
-        ),
-        ("operations_json", args.operations_json.to_string()),
-        ("selectors_json", args.selectors_json.to_string()),
-        ("git_sha", args.git_sha.to_string()),
-        ("git_branch", args.git_branch.to_string()),
-        (
-            "git_is_dirty",
-            if args.git_is_dirty { "1" } else { "0" }.to_string(),
-        ),
-        ("pkg_deps_json", pkg_deps_json),
-        ("pkg_kinds_json", pkg_kinds_json),
-    ]
-    .into_iter()
-    .map(|(k, v)| KvRow {
-        key: k.to_string(),
-        value: v,
-    })
-    .collect();
-
-    // ── project ───────────────────────────────────────────────────────────────
-    let tm = Instant::now();
-    write_rows_with_fields(&project_path(&dir), &kv_fields(), &kv_rows);
-    t("write project.parquet", tm);
+    let pkg_manifest_path_configs_json =
+        serde_json::to_string(&pkg_manifest_path_configs).unwrap_or_else(|_| "{}".into());
 
     // ── nodes ─────────────────────────────────────────────────────────────────
     let nf_fields = node_fields();
@@ -862,10 +1043,45 @@ pub fn save(args: &SaveArgs<'_>) -> Result<(), String> {
             for epoch in existing_epochs(&dir).into_iter().filter(|&e| e != 0) {
                 fs::remove_file(node_epoch_path(&dir, epoch)).ok();
             }
+
+            // Stamp this cold start with a generation token. dbt-index uses this
+            // to surface compile-row staleness: a compile row with ingested_at older
+            // than generation.ingested_at was produced before the last cold start.
+            // The decision of what to do with stale rows is left to the query layer
+            // (dbt.generation join) — we never delete compile data here.
+            write_rows_with_fields(
+                &generation_path(&dir),
+                &generation_fields(),
+                &[GenerationRow {
+                    ingested_at: args.ingested_at,
+                    version: args.version.to_string(),
+                    dbt_version: args.dbt_version.to_string(),
+                    project_name: args.project_name.to_string(),
+                    adapter_type: args.adapter_type.to_string(),
+                    vars_json: args.vars_json.to_string(),
+                    env_vars_json: args.env_vars_json.to_string(),
+                    profile_hash: args.profile_hash.to_string(),
+                    profile_file_hash: args.profile_file_hash.to_string(),
+                    project_file_hash: args.project_file_hash.to_string(),
+                    cli_vars_hash: args.cli_vars_hash.to_string(),
+                    packages_lock_hash: args.packages_lock_hash.to_string(),
+                }],
+            );
+
             any_uses_graph
         }
         Some(changed) => {
-            let exceeds_threshold = changed.len() > 100;
+            // Approximate total rows (excludes groups/macros in nodes, but close enough for a threshold).
+            let total_nodes = args.nodes.iter().count()
+                + args.disabled_nodes.iter().count()
+                + args.nodes.macros.len()
+                + args.disabled_nodes.macros.len()
+                + args.nodes.groups.len()
+                + args.disabled_nodes.groups.len()
+                + args.macros.macros.len()
+                + args.macros.docs_macros.len();
+            let threshold = (total_nodes / 10).max(10);
+            let exceeds_threshold = changed.len() > threshold;
 
             if exceeds_threshold {
                 // Full rewrite as epoch 0. Read back existing ingested_at values (projected,
@@ -914,32 +1130,45 @@ pub fn save(args: &SaveArgs<'_>) -> Result<(), String> {
                     tw,
                 );
 
-                // Periodic compaction.
-                if existing_epochs(&dir).len() as u32 > COMPACT_THRESHOLD {
+                // Periodic compaction: row-count (delta > 10% of alive) OR file-count (>8).
+                if dbt_metadata_parquet::epoch_io::should_compact(
+                    delta.len(),
+                    total_nodes,
+                    existing_epochs(&dir).len(),
+                ) {
                     compact(&dir);
                 }
                 any_uses_graph
             }
         }
     };
-    let mut project: Vec<KvRow> = read_rows(&project_path(&dir));
-    if let Some(row) = project.iter_mut().find(|r| r.key == "any_uses_graph") {
-        row.value = if any_uses_graph {
-            "1".into()
-        } else {
-            "0".into()
-        };
-    } else {
-        project.push(KvRow {
-            key: "any_uses_graph".into(),
-            value: if any_uses_graph {
-                "1".into()
-            } else {
-                "0".into()
-            },
-        });
-    }
-    write_rows_with_fields(&project_path(&dir), &kv_fields(), &project);
+    // ── resolver_state ────────────────────────────────────────────────────────
+    let tr = Instant::now();
+    write_rows_with_fields(
+        &resolver_state_path(&dir),
+        &resolver_state_fields(),
+        &[ResolverStateRow {
+            ingested_at: args.ingested_at,
+            dbt_profile_json: args.dbt_profile_json.to_string(),
+            vars_json: args.vars_json.to_string(),
+            env_vars_json: args.env_vars_json.to_string(),
+            get_relation_calls_json: args.get_relation_calls_json.to_string(),
+            get_columns_in_relation_calls_json: args.get_columns_in_relation_calls_json.to_string(),
+            patterned_dangling_sources_json: args.patterned_dangling_sources_json.to_string(),
+            nodes_with_resolution_errors_json: args.nodes_with_resolution_errors_json.to_string(),
+            nodes_with_access_errors_json: args.nodes_with_access_errors_json.to_string(),
+            operations_json: args.operations_json.to_string(),
+            selectors_json: args.selectors_json.to_string(),
+            git_sha: args.git_sha.to_string(),
+            git_branch: args.git_branch.to_string(),
+            git_is_dirty: args.git_is_dirty as i32,
+            pkg_deps_json,
+            pkg_kinds_json,
+            pkg_manifest_path_configs_json,
+            any_uses_graph: any_uses_graph as i32,
+        }],
+    );
+    t("write resolver_state.parquet", tr);
 
     // ── alive ────────────────────────────────────────────────────────────────
     let ta = Instant::now();
@@ -958,6 +1187,41 @@ pub fn save(args: &SaveArgs<'_>) -> Result<(), String> {
         ta,
     );
 
+    // ── parse/columns ─────────────────────────────────────────────────────────
+    let tc = Instant::now();
+    let parse_cols_dir = dir.join("columns");
+    fs::create_dir_all(&parse_cols_dir).ok();
+    let parse_col_rows =
+        collect_parse_column_rows(args.nodes, args.changed_nodes, args.ingested_at);
+    let alive_node_count = args.nodes.iter().count() + args.disabled_nodes.iter().count();
+    if let Err(e) = dbt_metadata_parquet::parse_columns::write_parse_columns(
+        &parse_cols_dir,
+        parse_col_rows,
+        args.changed_nodes,
+        Some(alive_node_count),
+        None,
+    ) {
+        eprintln!("[warning] Failed to write parse/columns: {e}");
+    }
+    t("write parse/columns", tc);
+
+    // ── parse/test_metadata ────────────────────────────────────────────────────
+    let tt = Instant::now();
+    let test_meta_dir = dir.join("test_metadata");
+    fs::create_dir_all(&test_meta_dir).ok();
+    let test_meta_rows =
+        collect_parse_test_metadata_rows(args.nodes, args.changed_nodes, args.ingested_at);
+    if let Err(e) = dbt_metadata_parquet::parse_test_metadata::write_parse_test_metadata(
+        &test_meta_dir,
+        test_meta_rows,
+        args.changed_nodes,
+        Some(alive_node_count),
+        None,
+    ) {
+        eprintln!("[warning] Failed to write parse/test_metadata: {e}");
+    }
+    t("write parse/test_metadata", tt);
+
     // Clean up legacy pkg_deps.parquet / pkg_kinds.parquet if still present.
     let _ = fs::remove_file(dir.join("pkg_deps.parquet"));
     let _ = fs::remove_file(dir.join("pkg_kinds.parquet"));
@@ -975,6 +1239,7 @@ pub struct LoadedState {
     pub profile_file_hash: String,
     pub project_file_hash: String,
     pub cli_vars_hash: String,
+    pub packages_lock_hash: String,
     pub dbt_profile_json: String,
     pub vars_json: String,
     pub env_vars_json: String,
@@ -997,12 +1262,8 @@ pub struct LoadedState {
 
 pub fn peek_any_uses_graph(out_dir: &Path) -> bool {
     let dir = cache_dir(out_dir);
-    let project: Vec<KvRow> = read_rows(&project_path(&dir));
-    project
-        .iter()
-        .find(|r| r.key == "any_uses_graph")
-        .map(|r| r.value == "1")
-        .unwrap_or(false)
+    let rows: Vec<ResolverStateRow> = read_rows(&resolver_state_path(&dir));
+    rows.first().map(|r| r.any_uses_graph != 0).unwrap_or(false)
 }
 
 pub fn load(out_dir: &Path) -> Option<LoadedState> {
@@ -1026,54 +1287,36 @@ pub fn load_filtered_with_unique_ids(
     if !dir.exists() {
         return None;
     }
-    let project_file = project_path(&dir);
-    if !project_file.exists() {
+    // generation.parquet is the presence sentinel — if it's missing the cache is invalid.
+    let gen_file = generation_path(&dir);
+    if !gen_file.exists() {
         return None;
     }
-    t("filecheck (dir+project exists)", t0);
+    t("filecheck (dir+generation exists)", t0);
 
     let t1 = Instant::now();
-    let project: Vec<KvRow> = read_rows(&project_file);
-    t(
-        &format!("read project.parquet ({} kv rows)", project.len()),
-        t1,
-    );
-
-    let get_kv = |key: &str| -> String {
-        project
-            .iter()
-            .find(|r| r.key == key)
-            .map(|r| r.value.clone())
-            .unwrap_or_default()
-    };
-
-    let version: u32 = get_kv("version").parse().ok()?;
-    let dbt_version = get_kv("dbt_version");
-    if dbt_version.is_empty() {
+    let generation_rows: Vec<GenerationRow> = read_rows(&gen_file);
+    let generation = generation_rows.into_iter().next()?;
+    // Empty dbt_version means the file is from before this field existed — treat as cache miss.
+    if generation.dbt_version.is_empty() {
         return None;
     }
-    let profile_hash = get_kv("profile_hash");
-    let profile_file_hash = get_kv("profile_file_hash");
-    let project_file_hash = get_kv("project_file_hash");
-    let cli_vars_hash = get_kv("cli_vars_hash");
-    let dbt_profile_json = get_kv("dbt_profile_json");
-    let vars_json = get_kv("vars_json");
-    let env_vars_json = get_kv("env_vars_json");
-    let get_relation_calls_json = get_kv("get_relation_calls_json");
-    let get_columns_in_relation_calls_json = get_kv("get_columns_in_relation_calls_json");
-    let patterned_dangling_sources_json = get_kv("patterned_dangling_sources_json");
-    let nodes_with_resolution_errors_json = get_kv("nodes_with_resolution_errors_json");
-    let nodes_with_access_errors_json = get_kv("nodes_with_access_errors_json");
-    let operations_json = get_kv("operations_json");
-    let selectors_json = get_kv("selectors_json");
-    let git_sha = get_kv("git_sha");
-    let git_branch = get_kv("git_branch");
-    let git_is_dirty = get_kv("git_is_dirty") == "1";
-    let any_uses_graph = get_kv("any_uses_graph") == "1";
+    let version: u32 = generation.version.parse().ok()?;
+    t("read generation.parquet", t1);
+
+    let t1b = Instant::now();
+    let rs_rows: Vec<ResolverStateRow> = read_rows(&resolver_state_path(&dir));
+    let rs = rs_rows.into_iter().next().unwrap_or_default();
+    t("read resolver_state.parquet", t1b);
 
     let t2 = Instant::now();
-    let packages = load_packages(&dir, &project)?;
-    t("load_packages (filestamps + pkg from KV)", t2);
+    let packages = load_packages_from_filestamps(
+        &dir,
+        &rs.pkg_deps_json,
+        &rs.pkg_kinds_json,
+        &rs.pkg_manifest_path_configs_json,
+    )?;
+    t("load_packages (filestamps + pkg from resolver_state)", t2);
 
     let t3 = Instant::now();
     let (nodes, disabled_nodes, docs_macros) = load_nodes(&dir, allowed_kinds, allowed_unique_ids)?;
@@ -1090,41 +1333,39 @@ pub fn load_filtered_with_unique_ids(
 
     Some(LoadedState {
         version,
-        dbt_version,
-        profile_hash,
-        profile_file_hash,
-        project_file_hash,
-        cli_vars_hash,
-        dbt_profile_json,
-        vars_json,
-        env_vars_json,
-        get_relation_calls_json,
-        get_columns_in_relation_calls_json,
-        patterned_dangling_sources_json,
-        nodes_with_resolution_errors_json,
-        nodes_with_access_errors_json,
-        operations_json,
+        dbt_version: generation.dbt_version,
+        profile_hash: generation.profile_hash,
+        profile_file_hash: generation.profile_file_hash,
+        project_file_hash: generation.project_file_hash,
+        cli_vars_hash: generation.cli_vars_hash,
+        packages_lock_hash: generation.packages_lock_hash,
+        dbt_profile_json: rs.dbt_profile_json,
+        vars_json: rs.vars_json,
+        env_vars_json: rs.env_vars_json,
+        get_relation_calls_json: rs.get_relation_calls_json,
+        get_columns_in_relation_calls_json: rs.get_columns_in_relation_calls_json,
+        patterned_dangling_sources_json: rs.patterned_dangling_sources_json,
+        nodes_with_resolution_errors_json: rs.nodes_with_resolution_errors_json,
+        nodes_with_access_errors_json: rs.nodes_with_access_errors_json,
+        operations_json: rs.operations_json,
         packages,
         nodes,
         disabled_nodes,
         docs_macros,
-        any_uses_graph,
-        selectors_json,
-        git_sha,
-        git_branch,
-        git_is_dirty,
+        any_uses_graph: rs.any_uses_graph != 0,
+        selectors_json: rs.selectors_json,
+        git_sha: rs.git_sha,
+        git_branch: rs.git_branch,
+        git_is_dirty: rs.git_is_dirty != 0,
     })
 }
 
-pub(crate) fn load_packages(dir: &Path, project: &[KvRow]) -> Option<Vec<PackageSnapshot>> {
-    let get_kv = |key: &str| -> String {
-        project
-            .iter()
-            .find(|r| r.key == key)
-            .map(|r| r.value.clone())
-            .unwrap_or_default()
-    };
-
+pub(crate) fn load_packages_from_filestamps(
+    dir: &Path,
+    pkg_deps_json: &str,
+    pkg_kinds_json: &str,
+    pkg_manifest_path_configs_json: &str,
+) -> Option<Vec<PackageSnapshot>> {
     let mut pkg_roots: HashMap<String, String> = HashMap::new();
     let mut pkg_paths: HashMap<String, HashMap<ResourcePathKind, Vec<(String, u64)>>> =
         HashMap::new();
@@ -1141,12 +1382,13 @@ pub(crate) fn load_packages(dir: &Path, project: &[KvRow]) -> Option<Vec<Package
             .push((row.path, row.mtime_ns as u64));
     }
 
-    // Read pkg_deps and pkg_kinds from project KV (folded in from separate files).
     let mut pkg_deps: HashMap<String, BTreeSet<String>> =
-        serde_json::from_str(&get_kv("pkg_deps_json")).unwrap_or_default();
+        serde_json::from_str(pkg_deps_json).unwrap_or_default();
+    let mut pkg_manifest_path_configs: BTreeMap<String, ManifestPathConfig> =
+        serde_json::from_str(pkg_manifest_path_configs_json).unwrap_or_default();
 
     let pkg_kinds_raw: BTreeMap<String, BTreeSet<String>> =
-        serde_json::from_str(&get_kv("pkg_kinds_json")).unwrap_or_default();
+        serde_json::from_str(pkg_kinds_json).unwrap_or_default();
     for (pkg_name, kinds) in &pkg_kinds_raw {
         for kind_str in kinds {
             let kind: ResourcePathKind = serde_json::from_str(&format!("\"{kind_str}\""))
@@ -1195,8 +1437,10 @@ pub(crate) fn load_packages(dir: &Path, project: &[KvRow]) -> Option<Vec<Package
         .map(|(name, root)| PackageSnapshot {
             package_root_path: root,
             package_name: name.clone(),
+            manifest_path_config: pkg_manifest_path_configs.remove(&name).unwrap_or_default(),
             all_paths: pkg_paths.remove(&name).unwrap_or_default(),
             dependencies: pkg_deps.remove(&name).unwrap_or_default(),
+            is_local_dep: false, // re-derived below after root is placed at index 0
         })
         .collect();
 
@@ -1212,6 +1456,15 @@ pub(crate) fn load_packages(dir: &Path, project: &[KvRow]) -> Option<Vec<Package
         .position(|p| !all_deps.contains(p.package_name.as_str()))
     {
         snapshots.swap(0, root_idx);
+    }
+
+    // Re-derive is_local_dep: non-root packages without a `dbt_packages` path component
+    // are local-path deps. Root (index 0) is always false.
+    for (i, snap) in snapshots.iter_mut().enumerate() {
+        snap.is_local_dep = i > 0
+            && !Path::new(&snap.package_root_path)
+                .components()
+                .any(|c| c.as_os_str() == "dbt_packages");
     }
 
     Some(snapshots)
@@ -1326,9 +1579,14 @@ fn deserialize_into(
 // ── PackageSnapshot ↔ DbtPackage ─────────────────────────────────────────────
 
 pub fn snapshot_packages(packages: &[DbtPackage]) -> Vec<PackageSnapshot> {
+    let root_package_path = packages
+        .first()
+        .map(|package| package.package_root_path.as_path())
+        .unwrap_or_else(|| Path::new(""));
     packages
         .iter()
-        .filter(|pkg| {
+        .enumerate()
+        .filter(|(_, pkg)| {
             // Internal packages are embedded in the binary and reconstructed at load time.
             // Saving them to the parquet cache is redundant and causes package-count mismatches
             // when the loader re-adds them fresh on top of a prev_dbt_state that already has them.
@@ -1336,7 +1594,7 @@ pub fn snapshot_packages(packages: &[DbtPackage]) -> Vec<PackageSnapshot> {
                 .components()
                 .any(|c| c.as_os_str() == "dbt_internal_packages")
         })
-        .map(|pkg| {
+        .map(|(i, pkg)| {
             let all_paths: HashMap<ResourcePathKind, Vec<(String, u64)>> = pkg
                 .all_paths
                 .iter()
@@ -1350,11 +1608,21 @@ pub fn snapshot_packages(packages: &[DbtPackage]) -> Vec<PackageSnapshot> {
                     (kind.clone(), rows)
                 })
                 .collect();
+            // Non-root deps installed via `dbt deps` land under dbt_packages/<name>.
+            // Local-path deps (`local: ../foo`) live at an arbitrary path outside dbt_packages.
+            // We detect local deps by the absence of the `dbt_packages` path component.
+            let is_local_dep = i > 0
+                && !pkg
+                    .package_root_path
+                    .components()
+                    .any(|c| c.as_os_str() == "dbt_packages");
             PackageSnapshot {
                 package_root_path: pkg.package_root_path.display().to_string(),
                 package_name: pkg.dbt_project.name.clone(),
+                manifest_path_config: ManifestPathConfig::from_package(pkg, root_package_path),
                 all_paths,
                 dependencies: pkg.dependencies.clone(),
+                is_local_dep,
             }
         })
         .collect()
@@ -1401,7 +1669,7 @@ mod tests {
         write_rows_with_fields(&node_epoch_path(&dir, 0), &node_fields(), &base);
 
         // Write 9 delta epochs, each updating "a" with an incrementing payload.
-        // The 9th delta triggers compact() (existing_epochs().len() > COMPACT_THRESHOLD=8).
+        // The 9th delta triggers compact() (file-count > 8).
         for i in 1u32..=9 {
             let delta = vec![make_row("a", &format!(r#"{{"v":{i}}}"#))];
             write_rows_with_fields(&node_epoch_path(&dir, i), &node_fields(), &delta);
@@ -1740,23 +2008,21 @@ mod tests {
             .collect();
         write_rows_with_fields(&filestamps_path(&dir), &filestamp_fields(), &filestamp_rows);
 
-        // Write project.parquet with pkg_deps_json and pkg_kinds_json KV entries.
+        // Write resolver_state.parquet with pkg_deps_json and pkg_kinds_json.
         let mut pkg_kinds_map: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         pkg_kinds_map
             .entry("pkg".to_string())
             .or_default()
             .insert("ModelPaths".to_string());
-        let project_rows: Vec<KvRow> = vec![
-            KvRow {
-                key: "pkg_deps_json".to_string(),
-                value: "{}".to_string(),
-            },
-            KvRow {
-                key: "pkg_kinds_json".to_string(),
-                value: serde_json::to_string(&pkg_kinds_map).unwrap(),
-            },
-        ];
-        write_rows_with_fields(&project_path(&dir), &kv_fields(), &project_rows);
+        write_rows_with_fields(
+            &resolver_state_path(&dir),
+            &resolver_state_fields(),
+            &[ResolverStateRow {
+                pkg_deps_json: "{}".to_string(),
+                pkg_kinds_json: serde_json::to_string(&pkg_kinds_map).unwrap(),
+                ..Default::default()
+            }],
+        );
 
         (tmp, pkg_root)
     }

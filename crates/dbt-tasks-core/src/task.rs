@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::path::Path;
@@ -9,11 +8,8 @@ use dbt_adapter::connection::{ConnectionBackpressure, ThreadLocalConnectionRecyc
 use dbt_adapter_core::AdapterType;
 use dbt_common::stats::NodeStatus;
 use dbt_common::{ErrorCode, FsResult, fs_err};
-use dbt_dag::schedule::Schedule;
-use dbt_schemas::schemas::profiles::Execute;
-use dbt_schemas::schemas::properties::UnitTestOverrides;
+use dbt_schemas::schemas::InternalDbtNodeAttributes;
 use dbt_schemas::schemas::telemetry::{ExecutionPhase, NodeType};
-use dbt_schemas::schemas::{InternalDbtNodeAttributes, Nodes};
 
 use crate::context::TaskRunnerCtx;
 use crate::span_manager::{SpanLevel, SpanTreeRequest};
@@ -21,8 +17,20 @@ use crate::task_spans::{
     node_processed_span_key, phase_span_key, task_span_on_close, task_span_on_skip,
     update_node_outcome_from_skip_reason,
 };
-use crate::test_aggregation::GenericTestAggregation;
 use crate::visitor::SkipReason;
+
+use dbt_common::collections::DashMap;
+use dbt_scheduler::instructions::{LpInstruction, SqlInstruction};
+use minijinja::Value as MinijinjaValue;
+
+// Unified result type for all task outputs (render and/or analyze phase)
+#[derive(Debug, Clone)]
+pub struct TaskResult {
+    pub sql_instruction: SqlInstruction,
+    pub config_map: Arc<DashMap<String, MinijinjaValue>>,
+    /// Present only when the analyze phase ran (Local/Sidecar/Service execution).
+    pub lp_instruction: Option<LpInstruction>,
+}
 
 /// Stands for Task Phase
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
@@ -236,19 +244,4 @@ pub struct TasksForNode {
     pub analyzeable: Option<Arc<dyn Task>>,
     pub runnable: Option<Arc<dyn Task>>,
     pub showable: Option<Arc<dyn Task>>,
-}
-
-/// Get the tasks for a node based on the phases and execute type
-pub trait TasksForNodeFactory: Send + Sync {
-    fn tasks_for_node(
-        &self,
-        unique_id: &str,
-        nodes: &Nodes,
-        schedule: &Schedule<String>,
-        execute: Execute,
-        phases: &[TP],
-        generic_test_aggregation: Option<&GenericTestAggregation>,
-        unit_test_overrides: Option<&UnitTestOverrides>,
-        reverse_deps: &HashMap<String, HashSet<String>>,
-    ) -> TasksForNode;
 }

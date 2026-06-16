@@ -14,8 +14,8 @@ use dbt_jinja_utils::node_resolver::NodeResolver;
 use dbt_jinja_utils::serde::{Omissible, into_typed_with_jinja};
 use dbt_jinja_utils::utils::generate_relation_name;
 use dbt_schemas::schemas::common::{
-    DbtChecksum, DbtMaterialization, FreshnessDefinition, FreshnessRules, NodeDependsOn,
-    merge_meta, merge_tags, normalize_quoting,
+    DbtChecksum, DbtMaterialization, DbtQuoting, FreshnessDefinition, FreshnessRules,
+    NodeDependsOn, merge_meta, merge_tags, normalize_quoting,
 };
 use dbt_schemas::schemas::dbt_column::process_columns;
 use dbt_schemas::schemas::project::SourceConfig;
@@ -360,8 +360,10 @@ pub async fn resolve_sources(
                         table_name
                     )
                 })?;
-                c.loaded_at_field = Some(merged.field);
-                c.loaded_at_query = Some(merged.query).into();
+                // Empty strings indicate "neither source nor table set this peer".
+                // Core represents this as null on the manifest, so collapse `""` → `None`.
+                c.loaded_at_field = Some(merged.field).filter(|s| !s.is_empty());
+                c.loaded_at_query = Some(merged.query).filter(|s| !s.is_empty()).into();
                 apply_freshness_loaded_at_override(c, &source_name, &table_name)?;
                 Ok(())
             },
@@ -375,25 +377,33 @@ pub async fn resolve_sources(
             arg.io.status_reporter.as_ref(),
         );
 
-        // This should be set due to propagation from the resolved root project
-        let properties_quoting = source_config.quoting;
+        // `user_quoting` is the raw source+table YAML merge (no defaults). It is
+        // serialized as `ManifestSource.quoting` and matches dbt-core's
+        // `source.quoting.merged(table.quoting)`. The resolved `table_quoting`
+        // below folds in project + adapter defaults and drives SQL generation.
+        let user_quoting = DbtQuoting::merge_user(source.quoting.as_ref(), table.quoting.as_ref());
 
-        let mut source_quoting = source.quoting.unwrap_or_default();
-        source_quoting.default_to(&properties_quoting);
-
-        let mut table_quoting = table.quoting.unwrap_or_default();
-        table_quoting.default_to(&source_quoting);
+        let mut table_quoting = user_quoting.unwrap_or_default();
+        table_quoting.default_to(&source_config.quoting);
         let quoting_ignore_case = table_quoting.snowflake_ignore_case.unwrap_or(false);
 
+        // Preserve the raw user-provided identifier (including any embedded quote
+        // characters) for `__source_attr__.identifier`. dbt-core stores this verbatim
+        // and packages such as `zendesk` rely on `source(...).identifier` round-tripping
+        // through Jinja — see `union_zendesk_connections` calling
+        // `adapter.get_relation(identifier=source(...).identifier)`. Stripping the
+        // quotes here would turn `"GROUP"` into `GROUP` and produce SQL that fails on
+        // reserved-keyword tables in Snowflake.
+        let raw_identifier = table
+            .identifier
+            .clone()
+            .unwrap_or_else(|| table_name.to_owned());
         let (database, schema, identifier, quoting) = normalize_quoting(
             &table_quoting.try_into()?,
             adapter_type,
             &database,
             &schema,
-            &table
-                .identifier
-                .clone()
-                .unwrap_or_else(|| table_name.to_owned()),
+            &raw_identifier,
         );
 
         let parse_adapter = jinja_env
@@ -457,17 +467,6 @@ pub async fn resolve_sources(
             }
         }
 
-        // Add any other non-standard dbt keys that might be used by dbt packages under
-        // the "other" key. This needs to be untyped since it's up to the packages to define
-        // what is a valid configuration entry.
-        //
-        // For example, dbt-external-tables have their own definition of what are valid
-        // values for the `external` property of a source: https://github.com/dbt-labs/dbt-external-tables
-        let other = match &table.external {
-            None => BTreeMap::new(),
-            Some(external) => BTreeMap::from([("external".to_owned(), external.clone())]),
-        };
-
         let static_analysis = source_config.static_analysis.clone();
 
         let unrendered_config = build_source_unrendered_config(
@@ -490,7 +489,7 @@ pub async fn resolve_sources(
                 ),
                 unique_id: unique_id.to_owned(),
                 fqn,
-                description: table.description.to_owned(),
+                description: Some(table.description.clone().unwrap_or_default()),
                 patch_path: Some(mpe.relative_path.clone()),
                 meta: source_config.meta.clone().unwrap_or_default(),
                 tags: source_config
@@ -530,19 +529,21 @@ pub async fn resolve_sources(
                     Omissible::Present(f) => f.clone(),
                     Omissible::Omitted => None,
                 },
-                identifier,
+                identifier: raw_identifier,
                 source_name: source_name.to_owned(),
                 source_description: source.description.clone().unwrap_or_default(), // needs to be some or empty string per dbt spec
                 loader: source.loader.clone().unwrap_or_default(),
                 loaded_at_field: source_config.loaded_at_field.clone(),
                 loaded_at_query: source_config.loaded_at_query.0.clone(),
+                user_quoting,
                 schema_origin: source_config.schema_origin,
                 sync: source_config.sync.clone(),
                 unrendered_database,
                 unrendered_schema,
+                external: table.external.clone(),
             },
             deprecated_config: source_config.clone().into(),
-            __other__: other,
+            __other__: BTreeMap::new(),
         };
         let status = if source_config.enabled {
             ModelStatus::Enabled

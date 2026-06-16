@@ -41,8 +41,11 @@ pub struct DbtColumn {
     #[serialize_always]
     #[serde(serialize_with = "serialize_dbt_column_desc")]
     pub description: Option<String>,
+    #[serde(default)]
     pub constraints: Vec<Constraint>,
+    #[serde(default)]
     pub meta: IndexMap<String, YmlValue>,
+    #[serde(default)]
     pub tags: Vec<String>,
     pub policy_tags: Option<Vec<String>>,
     pub databricks_tags: Option<BTreeMap<String, YmlValue>>,
@@ -50,6 +53,9 @@ pub struct DbtColumn {
     pub quote: Option<bool>,
     #[serde(default, rename = "config")]
     pub deprecated_config: ColumnConfig,
+    pub dimension: Option<ColumnPropertiesDimension>,
+    pub entity: Option<Entity>,
+    pub granularity: Option<Granularity>,
 }
 
 fn serialize_dbt_column_desc<S>(description: &Option<String>, s: S) -> Result<S::Ok, S::Error>
@@ -253,6 +259,51 @@ impl ColumnInheritanceRules {
     }
 }
 
+/// Hydrate a column's `dimension` so its writable-manifest shape matches what
+/// dbt-core expects for `ColumnDimension`. The dict form requires `name`
+/// (dbt-core has no default), so when YAML omits it we fall back to the
+/// column name — same behaviour as dbt-core's `ParserRef._add`. The bare-string
+/// form passes through unchanged.
+fn normalize_dimension(
+    dimension: Option<ColumnPropertiesDimension>,
+    column_name: &str,
+    column_description: Option<&str>,
+) -> Option<ColumnPropertiesDimension> {
+    match dimension? {
+        d @ ColumnPropertiesDimension::DimensionType(_) => Some(d),
+        ColumnPropertiesDimension::DimensionConfig(mut config) => {
+            if config.name.is_none() {
+                config.name = Some(column_name.to_string());
+            }
+            if config.description.is_none() {
+                config.description = column_description.map(str::to_string);
+            }
+            Some(ColumnPropertiesDimension::DimensionConfig(config))
+        }
+    }
+}
+
+/// Same shape constraint as `normalize_dimension` but for `entity`: dbt-core's
+/// `ColumnEntity` requires `name: str`.
+fn normalize_entity(
+    entity: Option<Entity>,
+    column_name: &str,
+    column_description: Option<&str>,
+) -> Option<Entity> {
+    match entity? {
+        e @ Entity::EntityType(_) => Some(e),
+        Entity::EntityConfig(mut config) => {
+            if config.name.is_none() {
+                config.name = Some(column_name.to_string());
+            }
+            if config.description.is_none() {
+                config.description = column_description.map(str::to_string);
+            }
+            Some(Entity::EntityConfig(config))
+        }
+    }
+}
+
 /// Process columns by merging parent config with each column's config.
 /// Returns a Vec of DbtColumn references.
 pub fn process_columns(
@@ -289,6 +340,17 @@ pub fn process_columns(
                     column_mask: cp.column_mask.clone(),
                     quote: cp.quote,
                     deprecated_config: cp.config.clone().unwrap_or_default(),
+                    dimension: normalize_dimension(
+                        cp.dimension.clone(),
+                        &cp.name,
+                        cp.description.as_deref(),
+                    ),
+                    entity: normalize_entity(
+                        cp.entity.clone(),
+                        &cp.name,
+                        cp.description.as_deref(),
+                    ),
+                    granularity: cp.granularity.clone(),
                 });
                 by_name.insert(cp.name.clone(), col);
             }
@@ -344,6 +406,54 @@ mod tests {
             "last definition should win"
         );
     }
+
+    /// Regression: `dimension: { type: time }` in YAML must produce a manifest
+    /// payload that dbt-core's `ColumnDimension` (which requires non-null `name`)
+    /// can deserialize. Previously fusion emitted `name: null`, which crashed
+    /// `parse_with_fusion` with `mashumaro.InvalidFieldValue`.
+    #[test]
+    fn test_process_columns_hydrates_dimension_config_name() {
+        let mut col = make_col("date_day", "Day grain.");
+        col.dimension = Some(ColumnPropertiesDimension::DimensionConfig(
+            ColumnPropertiesDimensionConfig {
+                type_: ColumnPropertiesDimensionType::time,
+                is_partition: None,
+                label: None,
+                name: None,
+                description: None,
+                config: None,
+                validity_params: None,
+            },
+        ));
+
+        let result = process_columns(Some(&vec![col]), None, None).unwrap();
+        let dimension = result[0].dimension.as_ref().expect("dimension preserved");
+        match dimension {
+            ColumnPropertiesDimension::DimensionConfig(c) => {
+                assert_eq!(c.name.as_deref(), Some("date_day"));
+                assert_eq!(c.description.as_deref(), Some("Day grain."));
+            }
+            other => panic!("expected DimensionConfig, got {other:?}"),
+        }
+    }
+
+    /// Bare-string `dimension: time` must pass through untouched — dbt-core
+    /// accepts it via the `DimensionType` arm of its Union.
+    #[test]
+    fn test_process_columns_preserves_bare_dimension_type() {
+        let mut col = make_col("ts", "");
+        col.dimension = Some(ColumnPropertiesDimension::DimensionType(
+            ColumnPropertiesDimensionType::time,
+        ));
+
+        let result = process_columns(Some(&vec![col]), None, None).unwrap();
+        assert!(matches!(
+            result[0].dimension,
+            Some(ColumnPropertiesDimension::DimensionType(
+                ColumnPropertiesDimensionType::time
+            ))
+        ));
+    }
 }
 
 #[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, DbtSchema, Eq, PartialEq)]
@@ -360,6 +470,7 @@ pub enum ColumnPropertiesDimensionType {
     time,
 }
 
+#[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Clone, DbtSchema, Eq, PartialEq)]
 pub struct ColumnPropertiesDimensionConfig {
     #[serde(rename = "type")]
@@ -372,7 +483,7 @@ pub struct ColumnPropertiesDimensionConfig {
     pub validity_params: Option<DimensionValidityParams>,
 }
 
-#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, DbtSchema)]
+#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, DbtSchema, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum Entity {
     EntityConfig(EntityConfig),
@@ -388,7 +499,8 @@ pub enum ColumnPropertiesEntityType {
     unique,
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, DbtSchema)]
+#[skip_serializing_none]
+#[derive(Deserialize, Serialize, Debug, Clone, DbtSchema, PartialEq, Eq)]
 pub struct EntityConfig {
     #[serde(rename = "type")]
     pub type_: ColumnPropertiesEntityType,

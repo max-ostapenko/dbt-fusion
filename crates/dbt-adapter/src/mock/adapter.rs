@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::adapter::adapter_impl::AdapterImpl;
-    use crate::sql_types::SATypeOpsImpl;
+    use crate::sql_types::DefaultTypeOps;
     use dbt_adapter_core::AdapterType;
 
     use dbt_schemas::schemas::relations::SNOWFLAKE_RESOLVED_QUOTING;
@@ -15,8 +15,8 @@ mod tests {
             AdapterType::Snowflake,
             BTreeMap::new(),
             SNOWFLAKE_RESOLVED_QUOTING,
-            Arc::new(SATypeOpsImpl::new(AdapterType::Snowflake)),
-            Arc::new(crate::stmt_splitter::NaiveStmtSplitter),
+            Arc::new(DefaultTypeOps::new(AdapterType::Snowflake)),
+            Arc::new(crate::stmt_splitter::DefaultStmtSplitter),
         );
         assert_eq!(adapter.adapter_type(), AdapterType::Snowflake);
     }
@@ -27,8 +27,8 @@ mod tests {
             AdapterType::Snowflake,
             BTreeMap::new(),
             SNOWFLAKE_RESOLVED_QUOTING,
-            Arc::new(SATypeOpsImpl::new(AdapterType::Snowflake)),
-            Arc::new(crate::stmt_splitter::NaiveStmtSplitter),
+            Arc::new(DefaultTypeOps::new(AdapterType::Snowflake)),
+            Arc::new(crate::stmt_splitter::DefaultStmtSplitter),
         );
         assert_eq!(adapter.quote("abc"), "\"abc\"");
     }

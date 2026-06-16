@@ -5,7 +5,10 @@ mod context;
 pub(crate) mod git_client;
 mod hub_client;
 mod network_client;
+mod notices;
 pub mod package_listing;
+mod package_resolver;
+
 pub mod private_package;
 pub mod semver;
 mod tarball_client;
@@ -30,7 +33,6 @@ use steps::{
     load_dbt_packages_lock_without_validation, try_load_valid_dbt_packages_lock,
 };
 use tracing::Instrument as _;
-use utils::{emit_scrubbed_package_name_warnings, scrubbed_package_names_from_package_def};
 
 use crate::context::DepsOperationContext;
 
@@ -61,7 +63,8 @@ pub async fn get_or_install_packages(
     if is_time_machine_replay {
         // Just load the existing package-lock.yml without any validation or fetching
         let dbt_packages_lock =
-            load_dbt_packages_lock_without_validation(io, packages_install_path, env, &vars)?
+            load_dbt_packages_lock_without_validation(io, packages_install_path, env, &vars)
+                .await?
                 .unwrap_or_default();
 
         emit_info_progress_message(
@@ -92,26 +95,29 @@ pub async fn get_or_install_packages(
     }
 
     // This gets the package entries from packages.yml or dependencies.yml
-    let (package_def, package_yml_name) = load_dbt_packages(io, &io.in_dir)?;
+    let (package_def, package_yml_name) = load_dbt_packages(io, &io.in_dir).await?;
 
     let dbt_packages_lock = if let Some(ref dbt_packages) = package_def {
-        // Check for dbt secrets in package definitions and emit warnings if found.
-        // Note that package lock scrubbing happens later after during lock generation,
-        // in install_packages
-        let scrubbed_package_names = scrubbed_package_names_from_package_def(dbt_packages);
-        emit_scrubbed_package_name_warnings(io, &scrubbed_package_names);
+        deps_context.notices.collect(dbt_packages);
 
-        if !upgrade
-            && !lock
-            && let Some(dbt_packages_lock) = try_load_valid_dbt_packages_lock(
+        let try_cached_lock = if !upgrade && !lock {
+            try_load_valid_dbt_packages_lock(
                 io,
                 packages_install_path,
                 dbt_packages,
                 env,
                 &vars,
                 use_v2_compatible_package_downloads,
-            )?
-        {
+            )
+            .await
+            .inspect_err(|_| {
+                deps_context.flush_notices(&DbtPackagesLock::default());
+            })?
+        } else {
+            None
+        };
+
+        if let Some(dbt_packages_lock) = try_cached_lock {
             emit_info_progress_message(
                 dbt_telemetry::ProgressMessage::new_from_action_and_target(
                     "Loading".to_string(),
@@ -145,6 +151,7 @@ pub async fn get_or_install_packages(
                 }
                 Err(e) => {
                     record_span_status(&fetch_span, Some(&e.to_string()));
+                    deps_context.flush_notices(&DbtPackagesLock::default());
                     return Err(e);
                 }
             }
@@ -164,7 +171,7 @@ pub async fn get_or_install_packages(
         }
 
         if let Some(dbt_packages_lock) =
-            load_dbt_packages_lock_without_validation(io, packages_install_path, env, &vars)?
+            load_dbt_packages_lock_without_validation(io, packages_install_path, env, &vars).await?
         {
             emit_info_progress_message(
                 dbt_telemetry::ProgressMessage::new_from_action_and_target(
@@ -198,7 +205,10 @@ pub async fn get_or_install_packages(
         install_packages(&deps_context, &dbt_packages_lock, packages_install_path)
             .instrument(install_span.clone())
             .await
-            .record_status(&install_span)?;
+            .record_status(&install_span)
+            .inspect_err(|_| {
+                deps_context.flush_notices(&dbt_packages_lock);
+            })?;
     }
 
     // A package is considered "missing" if the 'dbt_project.yml' file for that
@@ -237,7 +247,10 @@ pub async fn get_or_install_packages(
             install_packages(&deps_context, &dbt_packages_lock, packages_install_path)
                 .instrument(install_span.clone())
                 .await
-                .record_status(&install_span)?;
+                .record_status(&install_span)
+                .inspect_err(|_| {
+                    deps_context.flush_notices(&dbt_packages_lock);
+                })?;
 
             for package in dbt_packages_lock.packages.iter() {
                 if !packages_install_path.join(package.package_name()).exists() {
@@ -245,6 +258,7 @@ pub async fn get_or_install_packages(
                 }
             }
             if !missing_packages_after_auto_install.is_empty() {
+                deps_context.flush_notices(&dbt_packages_lock);
                 return err!(
                     ErrorCode::InvalidConfig,
                     "The following packages are missing from the packages install path: {:?}. Check you package definition and run 'fs deps' to install the missing packages.",
@@ -252,6 +266,7 @@ pub async fn get_or_install_packages(
                 );
             }
         } else {
+            deps_context.flush_notices(&dbt_packages_lock);
             return err!(
                 ErrorCode::InvalidConfig,
                 "The following packages are missing from the packages install path: {:?}. Check you package definition and run 'fs deps' to install the missing packages.",
@@ -259,6 +274,8 @@ pub async fn get_or_install_packages(
             );
         }
     }
+
+    deps_context.flush_notices(&dbt_packages_lock);
 
     Ok((
         dbt_packages_lock,

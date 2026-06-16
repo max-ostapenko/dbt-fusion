@@ -201,6 +201,59 @@ impl ModelFreshnessRules {
     }
 }
 
+pub fn model_freshness_rules_or_duration<'de, D>(
+    deserializer: D,
+) -> Result<Option<ModelFreshnessRules>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum ModelFreshnessRulesOrDuration {
+        Duration(String),
+        Rules(ModelFreshnessRules),
+    }
+
+    Option::<ModelFreshnessRulesOrDuration>::deserialize(deserializer)?
+        .map(|value| match value {
+            ModelFreshnessRulesOrDuration::Duration(duration) => {
+                model_freshness_rules_from_duration(&duration).map_err(serde::de::Error::custom)
+            }
+            ModelFreshnessRulesOrDuration::Rules(rules) => Ok(rules),
+        })
+        .transpose()
+}
+
+fn model_freshness_rules_from_duration(duration: &str) -> Result<ModelFreshnessRules, String> {
+    let parsed = humantime::parse_duration(duration)
+        .map_err(|e| format!("invalid lag_tolerance duration {duration:?}: {e}"))?;
+    let seconds = parsed.as_secs();
+
+    let (count, period) = if seconds == 0 {
+        (0, FreshnessPeriod::minute)
+    } else if seconds % (60 * 60 * 24) == 0 {
+        (seconds / (60 * 60 * 24), FreshnessPeriod::day)
+    } else if seconds % (60 * 60) == 0 {
+        (seconds / (60 * 60), FreshnessPeriod::hour)
+    } else if seconds % 60 == 0 {
+        (seconds / 60, FreshnessPeriod::minute)
+    } else {
+        return Err(format!(
+            "invalid lag_tolerance duration {duration:?}: expected a whole number of minutes, hours, or days"
+        ));
+    };
+
+    let count = i64::try_from(count).map_err(|_| {
+        format!("invalid lag_tolerance duration {duration:?}: duration is too large")
+    })?;
+
+    Ok(ModelFreshnessRules {
+        count: Some(count),
+        period: Some(period),
+        updates_on: None,
+    })
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, DbtSchema, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum FreshnessPeriod {
@@ -229,6 +282,44 @@ impl std::fmt::Display for FreshnessPeriod {
         };
         write!(f, "{period_str}")
     }
+}
+
+/// Reference: https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/artifacts/resources/v1/source_definition.py#L36
+#[derive(Deserialize, Serialize, Debug, Clone, DbtSchema)]
+pub struct ExternalPartitionConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub data_type: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub meta: IndexMap<String, YmlValue>,
+
+    pub __other__: IndexMap<String, YmlValue>,
+}
+
+#[derive(UntaggedEnumDeserialize, Serialize, Debug, Clone, DbtSchema)]
+#[serde(untagged)]
+pub enum ExternalPartition {
+    String(String),
+    ExternalPartitionConfig(ExternalPartitionConfig),
+}
+
+/// Reference: https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/artifacts/resources/v1/source_definition.py#L48
+/// These always get serialized, even if none.
+#[derive(Deserialize, Serialize, Debug, Clone, DbtSchema)]
+pub struct ExternalTable {
+    pub location: Option<String>,
+    pub file_format: Option<String>,
+    pub row_format: Option<String>,
+    pub tbl_properties: Option<String>,
+    // TODO: Add external partition validation as seen here:
+    // https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/artifacts/resources/v1/source_definition.py#L36
+    pub partitions: Option<Vec<ExternalPartition>>,
+
+    // `external` allows arbitrary, externally typed additional properties.
+    pub __other__: IndexMap<String, YmlValue>,
 }
 
 // We don't skip serializing none here because dbt project evaluator checks for the presence of either error_after or warn_after
@@ -566,6 +657,23 @@ impl DbtQuoting {
         self.identifier = self.identifier.or(other.identifier);
         self.schema = self.schema.or(other.schema);
     }
+
+    /// Shallow last-non-None-wins merge of two user-supplied quoting layers.
+    /// Returns `None` only when both inputs are `None` so callers can preserve
+    /// "user set nothing" on the manifest (no adapter defaults folded in).
+    /// Mirrors dbt-core's `source.quoting.merged(table.quoting)`.
+    pub fn merge_user(source: Option<&Self>, table: Option<&Self>) -> Option<Self> {
+        match (source, table) {
+            (None, None) => None,
+            _ => {
+                let mut q = table.copied().unwrap_or_default();
+                if let Some(s) = source {
+                    q.default_to(s);
+                }
+                Some(q)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -705,9 +813,12 @@ pub enum DbtUniqueKey {
     Multiple(Vec<String>),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, DbtSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, DbtSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OnSchemaChange {
+    // Matches dbt-core's default: `on_schema_change: Optional[str] = "ignore"`
+    // (core/dbt/artifacts/resources/v1/config.py).
+    #[default]
     Ignore,
     AppendNewColumns,
     Fail,
@@ -866,7 +977,7 @@ impl DbtChecksum {
         hasher.update(s);
         let checksum = hasher.finalize();
         Self::Object(DbtChecksumObject {
-            name: "SHA256".to_string(),
+            name: "sha256".to_string(),
             checksum: hex::encode(checksum),
         })
     }
@@ -887,7 +998,7 @@ impl DbtChecksum {
             hasher.update(trimmed_string.as_bytes());
             let checksum = hasher.finalize();
             Self::Object(DbtChecksumObject {
-                name: "SHA256".to_string(),
+                name: "sha256".to_string(),
                 checksum: hex::encode(checksum),
             })
         }
@@ -1186,8 +1297,12 @@ pub struct Dimension {
     pub config: Option<SemanticLayerElementConfig>,
 }
 
-fn default_false() -> bool {
+pub fn default_false() -> bool {
     false
+}
+
+pub fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, DbtSchema, PartialEq, Eq, Default)]

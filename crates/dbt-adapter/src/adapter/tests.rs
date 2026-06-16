@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use super::*;
 use crate::adapter::Adapter;
 use crate::adapter::adapter_impl::AdapterImpl;
-use crate::sql_types::SATypeOpsImpl;
-use crate::stmt_splitter::NaiveStmtSplitter;
+use crate::sql_types::DefaultTypeOps;
+use crate::stmt_splitter::DefaultStmtSplitter;
 use dbt_adapter_core::AdapterType;
 use dbt_common::cancellation::never_cancels;
 use dbt_schemas::schemas::relations::{DEFAULT_DBT_QUOTING, DEFAULT_RESOLVED_QUOTING};
@@ -27,8 +27,8 @@ fn make_duckdb_adapter() -> Arc<Adapter> {
         AdapterType::DuckDB,
         BTreeMap::new(),
         DEFAULT_RESOLVED_QUOTING,
-        Arc::new(SATypeOpsImpl::new(AdapterType::DuckDB)),
-        Arc::new(NaiveStmtSplitter),
+        Arc::new(DefaultTypeOps::new(AdapterType::DuckDB)),
+        Arc::new(DefaultStmtSplitter),
     );
     let adapter = Adapter::new(Arc::new(concrete), None, never_cancels());
     Arc::new(adapter)
@@ -40,7 +40,7 @@ fn make_duckdb_parse_adapter() -> Arc<Adapter> {
         AdapterType::DuckDB,
         dbt_yaml::Mapping::new(),
         DEFAULT_DBT_QUOTING,
-        Arc::new(SATypeOpsImpl::new(AdapterType::DuckDB)),
+        Arc::new(DefaultTypeOps::new(AdapterType::DuckDB)),
         None,
     );
     Arc::new(adapter)
@@ -209,4 +209,48 @@ fn test_location_exists_parse_mode_returns_false() {
     .unwrap();
     // Parse-mode adapter always returns false
     assert_eq!(result, Value::from(false));
+}
+
+// -- parse-mode arg permissiveness ----------------------------------------
+//
+// Python `@available.parse_*` decorators short-circuit at parse time without
+// inspecting argument types; macros that pass the "wrong" thing should still
+// receive the canned value. These tests pin that invariant: at parse time,
+// mistyped args do not raise — the Parse arm returns the canned response.
+
+#[test]
+fn test_parse_mode_accepts_mistyped_args_drop_relation() {
+    let adapter = make_duckdb_parse_adapter();
+    // drop_relation expects a BaseRelation; passing an integer would error at
+    // dispatch time pre-refactor. Parse mode must now ignore arg types.
+    let result = dispatch_test(&adapter, "drop_relation", &[Value::from(42)]).unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_parse_mode_accepts_mistyped_args_check_schema_exists() {
+    let adapter = make_duckdb_parse_adapter();
+    // check_schema_exists expects two strings; passing an int + list should not
+    // error at parse time — Parse arm returns the canned `true`.
+    let result = dispatch_test(
+        &adapter,
+        "check_schema_exists",
+        &[Value::from(42), Value::from(vec![Value::from("oops")])],
+    )
+    .unwrap();
+    assert_eq!(result, Value::from(true));
+}
+
+#[test]
+fn test_parse_mode_accepts_mistyped_args_list_relations_without_caching() {
+    let adapter = make_duckdb_parse_adapter();
+    // list_relations_without_caching expects a BaseRelation; pass a string instead.
+    let result = dispatch_test(
+        &adapter,
+        "list_relations_without_caching",
+        &[Value::from("oops")],
+    )
+    .unwrap();
+    // Parse-mode returns an empty list
+    assert!(result.try_iter().unwrap().next().is_none());
 }

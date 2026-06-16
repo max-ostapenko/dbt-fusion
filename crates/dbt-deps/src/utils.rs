@@ -5,19 +5,34 @@ use std::{
 };
 
 use dbt_schemas::schemas::{
-    packages::{DbtPackageEntry, DbtPackages, LocalPackage},
+    packages::{DbtPackageEntry, LocalPackage},
     project::DbtProjectNameOnly,
 };
 use sha1::Digest;
 
 use dbt_common::{
     ErrorCode, FsResult, constants::DBT_PROJECT_YML, err, fs_err, io_args::IoArgs, tokiofs,
-    tracing::emit::emit_warn_log_message,
 };
+
+const DEFAULT_DEPS_MAX_CONCURRENCY: usize = 8;
+const MAX_DEPS_CONCURRENCY: usize = 16;
+
+/// Max concurrent package resolutions within one BFS level.
+///
+/// Override with `DBT_DEPS_MAX_CONCURRENCY` (clamped to 1..=16).
+pub fn max_resolve_concurrency() -> usize {
+    match std::env::var("DBT_DEPS_MAX_CONCURRENCY") {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .map(|n| n.clamp(1, MAX_DEPS_CONCURRENCY))
+            .unwrap_or(DEFAULT_DEPS_MAX_CONCURRENCY),
+        Err(_) => DEFAULT_DEPS_MAX_CONCURRENCY,
+    }
+}
 use dbt_jinja_utils::{
     jinja_environment::JinjaEnv,
     phases::load::LoadContext,
-    serde::{into_typed_with_jinja, value_from_file},
+    serde::{into_typed_with_jinja, value_from_file_async},
     utils::SECRET_ENV_VAR_PREFIX,
 };
 use dbt_schemas::schemas::project::DbtProject;
@@ -140,45 +155,7 @@ pub fn scrub_package_name_secret_env_vars(package_name: &str) -> Option<Cow<'_, 
     }
 }
 
-pub fn scrubbed_package_names_from_package_def(dbt_packages: &DbtPackages) -> Vec<String> {
-    let mut scrubbed_package_names = Vec::new();
-
-    // https://github.com/dbt-labs/dbt-core/blob/c02340d4c14df1459c00cf91b9ab738e1c4c9507/core/dbt/deps/git.py#L56-L69
-    for package in &dbt_packages.packages {
-        match package {
-            DbtPackageEntry::Git(git_package) => {
-                if let Some(scrubbed) = scrub_package_name_secret_env_vars(git_package.git.as_str())
-                {
-                    scrubbed_package_names.push(scrubbed.into_owned());
-                }
-            }
-            DbtPackageEntry::Tarball(tarball_package) => {
-                if let Some(scrubbed) =
-                    scrub_package_name_secret_env_vars(tarball_package.tarball.as_str())
-                {
-                    scrubbed_package_names.push(scrubbed.into_owned());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    scrubbed_package_names
-}
-
-pub fn emit_scrubbed_package_name_warnings(io_args: &IoArgs, scrubbed_package_names: &[String]) {
-    for scrubbed in scrubbed_package_names {
-        emit_warn_log_message(
-            ErrorCode::DepsScrubbedPackageName,
-            format!(
-                "Detected secret env var in {scrubbed}. dbt will write a scrubbed representation to the lock file. This will cause issues with subsequent 'dbt deps' using the lock file, requiring 'dbt deps --upgrade'"
-            ),
-            io_args.status_reporter.as_ref(),
-        );
-    }
-}
-
-pub fn read_and_validate_dbt_project(
+pub async fn read_and_validate_dbt_project(
     io: &IoArgs,
     checkout_path: &Path,
     show_errors_or_warnings: bool,
@@ -186,7 +163,7 @@ pub fn read_and_validate_dbt_project(
     vars: &BTreeMap<String, dbt_yaml::Value>,
 ) -> FsResult<DbtProject> {
     let path_to_dbt_project = checkout_path.join(DBT_PROJECT_YML);
-    if !path_to_dbt_project.exists() {
+    if !tokiofs::path_exists(&path_to_dbt_project).await {
         return err!(
             ErrorCode::IoError,
             "Package does not contain a dbt_project.yml file: {}",
@@ -196,7 +173,8 @@ pub fn read_and_validate_dbt_project(
 
     // Try to deserialize only the package name for error reporting,
     // falling back to the path if deserialization fails
-    let dependency_package_name = value_from_file(io, &path_to_dbt_project, false, None)
+    let dependency_package_name = value_from_file_async(io, &path_to_dbt_project, false, None)
+        .await
         .ok()
         .and_then(|value| {
             let deps_context = LoadContext::new(vars.clone());
@@ -218,12 +196,13 @@ pub fn read_and_validate_dbt_project(
     let deps_context = LoadContext::new(vars.clone());
     into_typed_with_jinja(
         io,
-        value_from_file(
+        value_from_file_async(
             io,
             &path_to_dbt_project,
             show_errors_or_warnings,
             Some(&dependency_package_name),
-        )?,
+        )
+        .await?,
         false,
         jinja_env,
         &deps_context,

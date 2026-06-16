@@ -30,11 +30,13 @@ pub mod schemas {
     pub mod selectors;
     pub mod serde;
     mod sources;
-    pub use prev_state::{ModificationType, OnManifestLoadFailure, PreviousState};
+    pub mod user_settings;
+    pub use prev_state::{ModificationType, OnManifestLoadFailure, StateArtifacts};
     pub use run_results::{
         ContextRunResult, RunResultOutput, RunResultsArgs, RunResultsArtifact, RunResultsMetadata,
         TimingInfo,
     };
+    pub use user_settings::UserSettings;
 
     pub mod nodes;
     pub use nodes::{
@@ -102,7 +104,7 @@ pub mod schemas {
     pub mod dbt_cloud;
     pub use dbt_cloud::{
         CloudCredentials, DbtCloudConfig, DbtCloudContext, DbtCloudProject, DbtCloudProjectConfig,
-        ResolvedCloudConfig,
+        DbtCloudState, ResolvedCloudConfig,
     };
 
     pub mod semantic_layer {

@@ -150,16 +150,20 @@ pub struct GenericTestAsset {
     /// unversioned models and non-model resources. Used to build `attached_node` with the
     /// correct `.v<version>` suffix, matching dbt-core's `RefableLookup.get_unique_id`.
     pub version: Option<String>,
+    /// Tags from `columns[*].config.tags` in schema YAML, carried for generic column tests.
+    /// Empty for model-level and singular tests.
+    pub column_tags: Vec<String>,
 }
 
 impl fmt::Display for GenericTestAsset {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "GenericTestAsset {{ dbt_asset: {}, resource_name: {}, resource_type: {}, test_name: {}, test_metadata_name: {:?} }}",
+            "GenericTestAsset {{ dbt_asset: {}, resource_name: {}, resource_type: {}, source_name: {:?}, test_name: {}, test_metadata_name: {:?} }}",
             self.dbt_asset,
             self.resource_name,
             self.resource_type,
+            self.source_name,
             self.test_name,
             self.test_metadata_name
         )
@@ -170,6 +174,8 @@ impl fmt::Display for GenericTestAsset {
 pub struct DbtProfile {
     pub profile: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub defer_to_target: Option<String>,
     pub db_config: DbConfig,
     pub schema: String,
     pub database: String,
@@ -490,6 +496,63 @@ pub type GetRelationCalls = BTreeMap<String, Vec<Arc<dyn BaseRelation>>>;
 pub type GetColumnsInRelationCalls = BTreeMap<String, Vec<Arc<dyn BaseRelation>>>;
 pub type PatternedDanglingSources = BTreeMap<String, Vec<RelationPattern>>;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestPathConfig {
+    /// Package root relative to the root project directory. Empty for the root project.
+    pub package_root_prefix: PathBuf,
+    pub model_paths: Vec<String>,
+    pub seed_paths: Vec<String>,
+    pub snapshot_paths: Vec<String>,
+    pub test_paths: Vec<String>,
+    pub analysis_paths: Vec<String>,
+    pub function_paths: Vec<String>,
+    pub macro_paths: Vec<String>,
+    pub docs_paths: Vec<String>,
+}
+
+impl ManifestPathConfig {
+    pub fn from_dbt_project(dbt_project: &DbtProject) -> Self {
+        Self {
+            package_root_prefix: PathBuf::new(),
+            model_paths: dbt_project.model_paths.clone().unwrap_or_default(),
+            seed_paths: dbt_project.seed_paths.clone().unwrap_or_default(),
+            snapshot_paths: dbt_project.snapshot_paths.clone().unwrap_or_default(),
+            test_paths: dbt_project.test_paths.clone().unwrap_or_default(),
+            analysis_paths: dbt_project.analysis_paths.clone().unwrap_or_default(),
+            function_paths: dbt_project.function_paths.clone().unwrap_or_default(),
+            macro_paths: dbt_project.macro_paths.clone().unwrap_or_default(),
+            docs_paths: dbt_project.docs_paths.clone().unwrap_or_default(),
+        }
+    }
+
+    pub fn from_package(package: &DbtPackage, root_package_path: &Path) -> Self {
+        let mut config = Self::from_dbt_project(&package.dbt_project);
+        config.package_root_prefix = package
+            .package_root_path
+            .strip_prefix(root_package_path)
+            .ok()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        config
+    }
+
+    pub fn for_packages(packages: &[DbtPackage]) -> BTreeMap<String, Self> {
+        let root_package_path = packages
+            .first()
+            .map(|package| package.package_root_path.as_path())
+            .unwrap_or_else(|| Path::new(""));
+        packages
+            .iter()
+            .map(|package| {
+                (
+                    package.dbt_project.name.clone(),
+                    Self::from_package(package, root_package_path),
+                )
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolverState {
     pub root_project_name: String,
@@ -506,6 +569,11 @@ pub struct ResolverState {
     pub patterned_dangling_sources: PatternedDanglingSources,
     pub run_started_at: DateTime<Tz>,
     pub runtime_config: Arc<DbtRuntimeConfig>,
+    /// Minimal package-name lookup for manifest path serialization.
+    ///
+    /// This keeps artifact path normalization scoped to serialization instead
+    /// of depending on full package runtime configs.
+    pub manifest_path_configs: BTreeMap<String, ManifestPathConfig>,
     pub manifest_selectors: BTreeMap<String, DbtSelector>,
     pub resolved_selectors: ResolvedSelector,
     pub root_project_quoting: ResolvedQuoting,
@@ -535,6 +603,21 @@ impl ResolverState {
             }
         }
         reverse_deps
+    }
+
+    pub fn deep_clone(&self) -> Self {
+        // XXX: for some reason, Clone is not a deep clone yet
+        let mut resolved_state = self.clone();
+        resolved_state.node_resolver = resolved_state.node_resolver.deep_clone().into();
+        resolved_state
+    }
+
+    pub fn get_defer_node_by_id(&self, node_id: &str) -> Option<&dyn InternalDbtNodeAttributes> {
+        if let Some(defer_nodes) = &self.defer_nodes {
+            defer_nodes.get_node(node_id)
+        } else {
+            None
+        }
     }
 }
 
@@ -669,6 +752,8 @@ pub struct CacheState {
     /// The changed nodes, by unique id, based on file changes.
     /// Does not include any deleted or added nodes.
     pub changed_nodes: Arc<HashSet<String>>,
+    /// The impacted nodes, by unique id, from files changes.
+    pub impacted_nodes: Arc<HashSet<String>>,
 }
 impl CacheState {
     pub fn has_changes(&self) -> bool {

@@ -1,7 +1,7 @@
 //! Model-level lineage: `GET /api/v1/nodes/:unique_id/lineage`.
 //!
 //! Recursive CTE on `dbt.edges` walks both upstream and downstream from
-//! the root, bounded by `max_depth` (default 5). The response includes
+//! the root, bounded by `max_depth` (default 3, capped at 3). The response includes
 //! every node touched (joined with `dbt.nodes` for metadata) and every
 //! edge traversed.
 //!
@@ -9,7 +9,7 @@
 //! ```json
 //! {
 //!   "root": "model.foo.bar",
-//!   "max_depth": 5,
+//!   "max_depth": 3,
 //!   "nodes": [
 //!     { "unique_id": "model.foo.bar", "name": "bar",
 //!       "resource_type": "model", "materialized": "view", "depth": 0 },
@@ -26,23 +26,49 @@
 //! Only model-level edges (from `dbt.edges`); column-level lineage lives
 //! at `/column-lineage`.
 
+use arrow_array::{Array, RecordBatch, StringArray};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::handlers::json::{bad_request, batches_as_value_array, internal_error, not_found};
+use crate::handlers::node_base::extract_str_list;
 use crate::handlers::sql::escape_str;
 use crate::state::SharedState;
 
 /// Default and maximum traversal depth. Capped to keep responses bounded
 /// even if a misbehaving client requests something huge.
-const DEFAULT_MAX_DEPTH: u32 = 5;
-const HARD_MAX_DEPTH: u32 = 50;
+const DEFAULT_MAX_DEPTH: u32 = 3;
+const HARD_MAX_DEPTH: u32 = 3;
 
 #[derive(Debug, Deserialize)]
 pub struct LineageParams {
     pub max_depth: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct LineageNode {
+    unique_id: String,
+    name: String,
+    resource_type: String,
+    materialized: Option<String>,
+    depth: i32,
+}
+
+#[derive(Serialize)]
+struct LineageEdge {
+    from_id: String,
+    to_id: String,
+    edge_type: String,
+}
+
+#[derive(Serialize)]
+struct LineageResponse {
+    root: String,
+    max_depth: u32,
+    nodes: serde_json::Value,
+    edges: serde_json::Value,
 }
 
 pub async fn get_lineage(
@@ -58,6 +84,29 @@ pub async fn get_lineage(
         .unwrap_or(DEFAULT_MAX_DEPTH)
         .clamp(1, HARD_MAX_DEPTH);
     let escaped = escape_str(&unique_id);
+
+    // Saved queries aren't in dbt.edges / dbt.nodes; their upstream deps live
+    // on dbt.saved_queries. The unique_id prefix guarantees this — skip the
+    // probe entirely for all other resource types.
+    if unique_id.starts_with("saved_query.") {
+        let saved_query_sql = build_saved_query_probe_sql(&escaped);
+        let backend = state.providers.backend.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            backend
+                .query_arrow(&saved_query_sql)
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        let batches = match result {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => return internal_error(e),
+            Err(e) => return internal_error(e.to_string()),
+        };
+        return match extract_saved_query_root(&batches) {
+            Some(root) => saved_query_response(&unique_id, max_depth, root),
+            None => not_found(format!("node {unique_id} not found")),
+        };
+    }
 
     let nodes_sql = build_nodes_sql(&escaped, max_depth);
     let edges_sql = build_edges_sql(&escaped, max_depth);
@@ -81,7 +130,7 @@ pub async fn get_lineage(
         Err(err) => return internal_error(err.to_string()),
     };
     // The `nodes` query always returns the root row when the node exists
-    // in dbt.nodes, so an empty array means "node not found".
+    // in the metadata union, so an empty array means "node not found".
     if nodes.as_array().is_some_and(|a| a.is_empty()) {
         return not_found(format!("node {unique_id} not found"));
     }
@@ -90,17 +139,115 @@ pub async fn get_lineage(
         Err(err) => return internal_error(err.to_string()),
     };
 
-    Json(serde_json::json!({
-        "root": unique_id,
-        "max_depth": max_depth,
-        "nodes": nodes,
-        "edges": edges,
-    }))
+    Json(LineageResponse {
+        root: unique_id,
+        max_depth,
+        nodes,
+        edges,
+    })
+    .into_response()
+}
+
+struct SavedQueryRoot {
+    name: String,
+    depends_on_nodes: Vec<String>,
+}
+
+fn build_saved_query_probe_sql(root_id: &str) -> String {
+    format!(
+        "SELECT unique_id, name, depends_on_nodes \
+         FROM dbt.saved_queries WHERE unique_id = '{root_id}' LIMIT 1"
+    )
+}
+
+fn extract_saved_query_root(batches: &[RecordBatch]) -> Option<SavedQueryRoot> {
+    let batch = batches.iter().find(|b| b.num_rows() > 0)?;
+    let uid_col = batch
+        .column_by_name("unique_id")?
+        .as_any()
+        .downcast_ref::<StringArray>()?;
+    if uid_col.is_null(0) {
+        return None;
+    }
+    let unique_id = uid_col.value(0);
+    // `name` should always be present, but fall back to the last dotted segment
+    // of `unique_id` rather than returning None and producing a spurious 404.
+    let name = batch
+        .column_by_name("name")
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .and_then(|c| {
+            if c.is_null(0) {
+                None
+            } else {
+                Some(c.value(0).to_owned())
+            }
+        })
+        .unwrap_or_else(|| unique_id.rsplit('.').next().unwrap_or(unique_id).to_owned());
+    Some(SavedQueryRoot {
+        name,
+        depends_on_nodes: extract_str_list(batch, "depends_on_nodes"),
+    })
+}
+
+/// Build the lineage response for a saved_query root. Saved queries sit
+/// outside `dbt.edges`, so we synthesize the root row + one upstream row per
+/// `depends_on_nodes` entry, with edges pointing each upstream → root.
+/// `resource_type` for each upstream is inferred from the dotted prefix
+/// (`metric.x.y` → `metric`); bare ids fall back to `"node"`.
+///
+/// Doesn't walk further upstream from those nodes in this revision — the
+/// recursive CTE would need a multi-root variant; saved queries today are
+/// 1-hop deep in practice.
+fn saved_query_response(unique_id: &str, max_depth: u32, root: SavedQueryRoot) -> Response {
+    let mut nodes: Vec<LineageNode> = Vec::with_capacity(root.depends_on_nodes.len() + 1);
+    nodes.push(LineageNode {
+        unique_id: unique_id.to_owned(),
+        name: root.name,
+        resource_type: "saved_query".to_owned(),
+        materialized: None,
+        depth: 0,
+    });
+    let mut edges: Vec<LineageEdge> = Vec::with_capacity(root.depends_on_nodes.len());
+    for upstream_id in root.depends_on_nodes {
+        let resource_type = match upstream_id.split_once('.') {
+            Some((prefix, _)) => prefix.to_owned(),
+            None => "node".to_owned(),
+        };
+        let name = upstream_id
+            .rsplit('.')
+            .next()
+            .unwrap_or(&upstream_id)
+            .to_owned();
+        nodes.push(LineageNode {
+            unique_id: upstream_id.clone(),
+            name,
+            resource_type,
+            materialized: None,
+            depth: -1,
+        });
+        edges.push(LineageEdge {
+            from_id: upstream_id,
+            to_id: unique_id.to_owned(),
+            edge_type: "saved_query".to_owned(),
+        });
+    }
+    // serde_json::to_value on a Vec<T: Serialize> of plain structs is infallible.
+    let nodes_val = serde_json::to_value(nodes).unwrap_or_default();
+    let edges_val = serde_json::to_value(edges).unwrap_or_default();
+    Json(LineageResponse {
+        root: unique_id.to_owned(),
+        max_depth,
+        nodes: nodes_val,
+        edges: edges_val,
+    })
     .into_response()
 }
 
 /// Build the recursive-CTE query that returns every node within
-/// `max_depth` hops of `<root_id>`, joined with metadata from `dbt.nodes`.
+/// `max_depth` hops of `<root_id>`, joined with metadata from the union of
+/// per-resource tables (`dbt.nodes` plus `dbt.metrics`, `dbt.semantic_models`,
+/// `dbt.exposures` — none of which live in `dbt.nodes` but all of which can
+/// appear in `dbt.edges`).
 ///
 /// Output columns: `unique_id`, `name`, `resource_type`, `materialized`,
 /// `depth` (signed: negative upstream, 0 root, positive downstream).
@@ -133,12 +280,21 @@ fn build_nodes_sql(root_id: &str, max_depth: u32) -> String {
              SELECT unique_id, MIN(depth) FROM upstream GROUP BY unique_id \
              UNION ALL \
              SELECT unique_id, MAX(depth) FROM downstream GROUP BY unique_id \
+         ), \
+         metadata AS ( \
+             SELECT unique_id, name, resource_type, materialized FROM dbt.nodes \
+             UNION ALL \
+             SELECT unique_id, name, 'metric' AS resource_type, NULL AS materialized FROM dbt.metrics \
+             UNION ALL \
+             SELECT unique_id, name, 'semantic_model' AS resource_type, NULL AS materialized FROM dbt.semantic_models \
+             UNION ALL \
+             SELECT unique_id, name, 'exposure' AS resource_type, NULL AS materialized FROM dbt.exposures \
          ) \
-         SELECT n.unique_id, n.name, n.resource_type, n.materialized, \
+         SELECT m.unique_id, m.name, m.resource_type, m.materialized, \
                 MIN(a.depth) AS depth \
-         FROM all_ids a JOIN dbt.nodes n ON n.unique_id = a.unique_id \
-         GROUP BY n.unique_id, n.name, n.resource_type, n.materialized \
-         ORDER BY depth, n.resource_type, n.name"
+         FROM all_ids a JOIN metadata m ON m.unique_id = a.unique_id \
+         GROUP BY m.unique_id, m.name, m.resource_type, m.materialized \
+         ORDER BY depth, m.resource_type, m.name"
     )
 }
 
@@ -181,3 +337,7 @@ fn build_edges_sql(root_id: &str, max_depth: u32) -> String {
          ORDER BY e.parent_unique_id, e.child_unique_id"
     )
 }
+
+#[cfg(test)]
+#[path = "lineage_tests.rs"]
+mod tests;

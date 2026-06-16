@@ -15,14 +15,14 @@ use dbt_telemetry::{ExecutionPhase, NodeEvaluated, NodeProcessed, NodeType};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 type YmlValue = dbt_yaml::Value;
-use crate::schemas::common::{PersistDocsConfig, hooks_equal, normalize_sql};
+use crate::schemas::common::{ExternalTable, PersistDocsConfig, hooks_equal, normalize_sql};
 use crate::schemas::dbt_column::{DbtColumnRef, deserialize_dbt_columns, serialize_dbt_columns};
 use crate::schemas::manifest::GrantAccessToTarget;
 use crate::schemas::project::configs::common::log_state_mod_diff;
 use crate::schemas::project::configs::common::{grants_eq, meta_eq, tags_eq, tags_eq_vec};
 use crate::schemas::project::{WarehouseSpecificNodeConfig, same_warehouse_config};
 use crate::schemas::relations::default_dbt_quoting_for;
-use crate::schemas::serde::{QueryTag, StringOrArrayOfStrings};
+use crate::schemas::serde::{PartitionsConfig, QueryTag, StringOrArrayOfStrings};
 use crate::schemas::{
     common::{
         Access, ClusterConfig, DbtChecksum, DbtContract, DbtIncrementalStrategy,
@@ -4502,7 +4502,7 @@ pub struct NodeBaseAttributes {
     #[serde(default)]
     pub compute: Option<ComputeArg>,
     pub enabled: bool,
-    #[serde(skip_serializing, default = "default_false")]
+    #[serde(skip_serializing, default = "crate::schemas::common::default_false")]
     pub extended_model: bool,
 
     // Documentation persistence configuration
@@ -4733,6 +4733,7 @@ pub struct DbtTestAttr {
 #[serde(rename_all = "snake_case")]
 pub struct TestMetadata {
     pub name: String,
+    #[serde(default)]
     pub kwargs: BTreeMap<String, YmlValue>,
     pub namespace: Option<String>,
 }
@@ -4807,6 +4808,11 @@ pub struct DbtSourceAttr {
     pub loader: String,
     pub loaded_at_field: Option<String>,
     pub loaded_at_query: Option<String>,
+    /// User-supplied quoting (source-level merged with table-level), with no
+    /// project/adapter defaults applied. Mirrors `source.quoting.merged(table.quoting)`
+    /// in dbt-core and is what gets serialized to the manifest. The resolved
+    /// quoting used for SQL generation lives on `NodeBaseAttributes.quoting`.
+    pub user_quoting: Option<crate::schemas::common::DbtQuoting>,
     #[serialize_always]
     pub freshness: Option<FreshnessDefinition>,
     /// Specifies where the schema metadata originates: 'remote' (default) or 'local'
@@ -4816,6 +4822,8 @@ pub struct DbtSourceAttr {
     /// Reference: https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/artifacts/resources/v1/source_definition.py#L85-L86
     pub unrendered_database: Option<String>,
     pub unrendered_schema: Option<String>,
+    /// Reference: https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/artifacts/resources/v1/source_definition.py#L74-L75
+    pub external: Option<ExternalTable>,
 }
 
 impl DbtSource {
@@ -5294,6 +5302,7 @@ impl AdapterAttr {
                         .snowflake_initialization_warehouse
                         .clone(),
                     snowflake_warehouse: config.snowflake_warehouse.clone(),
+                    refresh_warehouse: config.refresh_warehouse.clone(),
                     immutable_where: config.immutable_where.clone(),
                     refresh_mode: config.refresh_mode.clone(),
                     initialize: config.initialize.clone(),
@@ -5399,6 +5408,7 @@ impl AdapterAttr {
                             .snowflake_initialization_warehouse
                             .clone(),
                         snowflake_warehouse: config.snowflake_warehouse.clone(),
+                        refresh_warehouse: config.refresh_warehouse.clone(),
                         immutable_where: config.immutable_where.clone(),
                         refresh_mode: config.refresh_mode.clone(),
                         initialize: config.initialize.clone(),
@@ -5501,6 +5511,7 @@ pub struct SnowflakeAttr {
     pub target_lag: Option<String>,
     pub snowflake_initialization_warehouse: Option<String>,
     pub snowflake_warehouse: Option<String>,
+    pub refresh_warehouse: Option<String>,
     pub immutable_where: Option<String>,
     pub refresh_mode: Option<String>,
     pub initialize: Option<String>,
@@ -5568,7 +5579,7 @@ pub struct BigQueryAttr {
     pub require_partition_filter: Option<bool>,
     pub partition_expiration_days: Option<u64>,
     pub grant_access_to: Option<Vec<GrantAccessToTarget>>,
-    pub partitions: Option<Vec<String>>,
+    pub partitions: Option<PartitionsConfig>,
     pub enable_refresh: Option<bool>,
     pub refresh_interval_minutes: Option<f64>,
     pub max_staleness: Option<String>,
@@ -5586,10 +5597,6 @@ pub struct RedshiftAttr {
     pub dist: Option<String>,
     pub sort: Option<StringOrArrayOfStrings>,
     pub sort_type: Option<String>,
-}
-
-fn default_false() -> bool {
-    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

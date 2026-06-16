@@ -6,7 +6,6 @@ pub use config::{BaseRelationChangeSet, BaseRelationConfig, ComponentConfig, Rel
 // Relation and RelationConfig for different data warehouses
 pub mod bigquery;
 pub mod databricks;
-pub mod parse;
 pub mod redshift;
 pub mod snowflake;
 
@@ -23,12 +22,6 @@ pub use relation_object::{
 
 pub(crate) mod config_v2;
 
-pub(crate) fn duckdb_should_include_database(database: Option<&str>) -> bool {
-    database.is_some_and(|db| {
-        !db.is_empty() && !db.eq_ignore_ascii_case("main") && !db.eq_ignore_ascii_case("memory")
-    })
-}
-
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
@@ -38,10 +31,7 @@ mod tests {
     use dbt_schemas::dbt_types::RelationType;
     use dbt_schemas::{
         filter::{RunFilter, Sample},
-        schemas::{
-            common::ResolvedQuoting,
-            relations::base::{BaseRelation as _, TableFormat},
-        },
+        schemas::{common::ResolvedQuoting, relations::base::BaseRelation as _},
     };
 
     use crate::AdapterType;
@@ -50,19 +40,13 @@ mod tests {
 
     #[test]
     fn test_render_with_run_filter_snowflake_adapter() {
-        let mut relation = Relation::new(
+        let relation = Relation::new(
             AdapterType::Snowflake,
-            None,
-            None,
-            Some("my_table".to_owned()),
-            None,
-            None,
-            ResolvedQuoting::disabled(),
-            None,
-            false,
-            false,
-        );
-        relation.table_format = TableFormat::Default;
+            None::<String>,
+            None::<String>,
+            "my_table".to_owned(),
+        )
+        .with_quoting(ResolvedQuoting::disabled());
         let start = NaiveDate::from_ymd_opt(2024, 7, 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
@@ -99,16 +83,11 @@ mod tests {
     fn test_render_with_run_filter_snowflake_microbatch_includes_utc_offset() {
         let relation = Relation::new(
             AdapterType::Snowflake,
-            None,
-            None,
-            Some("stg_events".to_owned()),
-            None,
-            None,
-            ResolvedQuoting::disabled(),
-            None,
-            false,
-            false,
-        );
+            None::<String>,
+            None::<String>,
+            "stg_events".to_owned(),
+        )
+        .with_quoting(ResolvedQuoting::disabled());
         let start = NaiveDate::from_ymd_opt(2026, 4, 27)
             .unwrap()
             .and_hms_opt(16, 0, 0)
@@ -142,16 +121,11 @@ mod tests {
     fn test_render_with_run_filter_bigquery_adapter() {
         let relation = Relation::new(
             AdapterType::Bigquery,
-            None,
-            None,
-            Some("my_table".to_owned()),
-            None,
-            None,
-            ResolvedQuoting::disabled(),
-            None,
-            false,
-            false,
-        );
+            None::<String>,
+            None::<String>,
+            "my_table".to_owned(),
+        )
+        .with_quoting(ResolvedQuoting::disabled());
         let start = NaiveDate::from_ymd_opt(2024, 7, 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
@@ -184,16 +158,11 @@ mod tests {
         // relation impl in core doesn't seem to override this
         let relation = Relation::new(
             AdapterType::Redshift,
-            None,
-            None,
-            Some("my_table".to_owned()),
-            None,
-            None,
-            ResolvedQuoting::disabled(),
-            None,
-            false,
-            false,
-        );
+            None::<String>,
+            None::<String>,
+            "my_table".to_owned(),
+        )
+        .with_quoting(ResolvedQuoting::disabled());
         let start = NaiveDate::from_ymd_opt(2024, 7, 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
@@ -226,16 +195,11 @@ mod tests {
         // relation impl in dbt-databricks doesn't seem to override this
         let relation = Relation::new(
             AdapterType::Databricks, // ?
-            None,
-            None,
-            Some("my_table".to_owned()),
-            None,
-            None,
-            ResolvedQuoting::disabled(),
-            None,
-            false,
-            false,
-        );
+            None::<String>,
+            None::<String>,
+            "my_table".to_owned(),
+        )
+        .with_quoting(ResolvedQuoting::disabled());
         let start = NaiveDate::from_ymd_opt(2024, 7, 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)
@@ -264,20 +228,6 @@ mod tests {
     }
 
     #[test]
-    fn test_duckdb_should_include_database_for_attached_catalog() {
-        assert!(duckdb_should_include_database(Some("stocks_dev")));
-    }
-
-    #[test]
-    fn test_duckdb_should_not_include_database_for_default_catalog() {
-        assert!(!duckdb_should_include_database(Some("main")));
-        assert!(!duckdb_should_include_database(Some("memory")));
-        assert!(!duckdb_should_include_database(Some("MEMORY")));
-        assert!(!duckdb_should_include_database(Some("")));
-        assert!(!duckdb_should_include_database(None));
-    }
-
-    #[test]
     fn test_do_create_relation_duckdb_includes_attached_catalog() {
         let relation = do_create_relation(
             AdapterType::DuckDB,
@@ -303,16 +253,11 @@ mod tests {
     fn test_render_with_run_filter_clickhouse_adapter() {
         let relation = Relation::new(
             AdapterType::ClickHouse,
-            None,
-            Some("analytics".to_string()),
-            Some("events".to_owned()),
-            None,
-            None,
-            ResolvedQuoting::disabled(),
-            None,
-            false,
-            false,
-        );
+            None::<String>,
+            "analytics".to_string(),
+            "events".to_owned(),
+        )
+        .with_quoting(ResolvedQuoting::disabled());
         let start = NaiveDate::from_ymd_opt(2024, 7, 1)
             .unwrap()
             .and_hms_opt(0, 0, 0)

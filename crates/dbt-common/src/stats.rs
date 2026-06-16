@@ -20,6 +20,7 @@ pub enum NodeStatus {
     ReusedNoChanges(String),
     ReusedStillFresh(String, u64, u64),
     ReusedStillFreshNoChanges(String),
+    ReusedCloned(Option<u64>),
     NoOp,
 }
 
@@ -29,6 +30,7 @@ impl NodeStatus {
             NodeStatus::ReusedNoChanges(message) => Some(message.clone()),
             NodeStatus::ReusedStillFresh(message, _, _) => Some(message.clone()),
             NodeStatus::ReusedStillFreshNoChanges(message) => Some(message.clone()),
+            NodeStatus::ReusedCloned(_) => Some(self.default_message()),
             _ => None,
         }
     }
@@ -45,6 +47,10 @@ impl NodeStatus {
             NodeStatus::ReusedNoChanges(msg) => msg.clone(),
             NodeStatus::ReusedStillFresh(msg, _, _) => msg.clone(),
             NodeStatus::ReusedStillFreshNoChanges(msg) => msg.clone(),
+            NodeStatus::ReusedCloned(None) => "Cloned from cached relation".to_string(),
+            NodeStatus::ReusedCloned(Some(_)) => {
+                "Cloned from cached relation within freshness tolerance".to_string()
+            }
             NodeStatus::SucceededWithWarning => "Warn".to_string(),
             NodeStatus::NoOp => "Skipped".to_string(),
         }
@@ -62,6 +68,7 @@ impl From<NodeStatus> for NodeOutcome {
             NodeStatus::ReusedNoChanges(_) => NodeOutcome::Skipped,
             NodeStatus::ReusedStillFresh(_, _, _) => NodeOutcome::Skipped,
             NodeStatus::ReusedStillFreshNoChanges(_) => NodeOutcome::Skipped,
+            NodeStatus::ReusedCloned(_) => NodeOutcome::Skipped,
             NodeStatus::NoOp => NodeOutcome::Skipped,
         }
     }
@@ -71,6 +78,9 @@ impl From<NodeStatus> for NodeOutcome {
 pub struct Stat {
     pub unique_id: String,
     pub num_rows: Option<usize>,
+    /// Rows affected by the warehouse DML (e.g. `CREATE TABLE AS SELECT`).
+    /// Set from the NodeEvaluated OTel span after execution; `None` for views.
+    pub rows_affected: Option<i64>,
     pub start_time: SystemTime,
     pub end_time: SystemTime,
     pub status: NodeStatus,
@@ -93,6 +103,7 @@ impl Stat {
         Stat {
             unique_id,
             num_rows,
+            rows_affected: None,
             start_time,
             end_time,
             status,
@@ -158,6 +169,7 @@ impl Stat {
             NodeStatus::ReusedNoChanges(_) => "reused".to_string(),
             NodeStatus::ReusedStillFresh(_, _, _) => "reused".to_string(),
             NodeStatus::ReusedStillFreshNoChanges(_) => "reused".to_string(),
+            NodeStatus::ReusedCloned(_) => "reused".to_string(),
             NodeStatus::NoOp => "skipped".to_string(),
         }
     }
@@ -245,6 +257,14 @@ mod tests {
         assert_eq!(
             NodeStatus::ReusedNoChanges("Model reused".to_string()).default_message(),
             "Model reused"
+        );
+        assert_eq!(
+            NodeStatus::ReusedCloned(None).default_message(),
+            "Cloned from cached relation"
+        );
+        assert_eq!(
+            NodeStatus::ReusedCloned(Some(3600)).default_message(),
+            "Cloned from cached relation within freshness tolerance"
         );
     }
 

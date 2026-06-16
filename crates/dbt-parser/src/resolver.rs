@@ -30,13 +30,14 @@ use crate::dbt_project_config::{RootProjectConfigs, build_root_project_configs};
 use crate::resolve::resolve_groups::resolve_groups;
 use crate::resolve::resolve_operations::resolve_operations;
 use crate::resolve::resolve_query_comment::resolve_query_comment;
+use crate::resolver_hooks::ResolverHooks;
 use crate::utils::{self, clear_package_diagnostics};
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_schemas::schemas::common::DbtQuoting;
 use dbt_schemas::schemas::telemetry::{ExecutionPhase, NodeType, PhaseExecuted};
 use dbt_schemas::state::{
     DbtPackage, GenericTestAsset, GetColumnsInRelationCalls, GetRelationCalls, Macros,
-    PatternedDanglingSources, RenderResults,
+    ManifestPathConfig, PatternedDanglingSources, RenderResults,
 };
 use dbt_schemas::state::{DbtRuntimeConfig, Operations};
 use dbt_schemas::state::{DbtState, ResolverState};
@@ -97,6 +98,7 @@ pub async fn resolve(
     patterned_dangling_sources: PatternedDanglingSources,
     token: &CancellationToken,
     jinja_type_checking_event_listener_factory: Arc<dyn JinjaTypeCheckingEventListenerFactory>,
+    resolver_hooks: Arc<dyn ResolverHooks>,
 ) -> FsResult<(ResolverState, Arc<JinjaEnv>)> {
     // Get the root project name
     let root_project_name = dbt_state.root_project_name();
@@ -140,7 +142,7 @@ pub async fn resolve(
             name: "__overview__".to_string(),
             package_name: "dbt".to_string(),
             path: PathBuf::from("overview.md"),
-            original_file_path: PathBuf::from("overview.md"),
+            original_file_path: PathBuf::from("docs/overview.md"),
             unique_id: overview_uid,
             block_contents: DEFAULT_OVERVIEW_CONTENTS.to_string(),
         });
@@ -164,10 +166,10 @@ pub async fn resolve(
         dbt_state.root_project_flags(),
         dbt_state.run_started_at,
         invocation_args,
-        dbt_state
-            .packages
-            .iter()
-            .map(|p| p.dbt_project.name.clone())
+        macros
+            .macros
+            .values()
+            .map(|m| m.package_name.clone())
             .collect(),
         arg.io.clone(),
         dbt_state.catalogs.clone(),
@@ -183,6 +185,7 @@ pub async fn resolve(
 
     // let mut nodes = Nodes::default();
     let mut disabled_nodes = Nodes::default();
+    resolver_hooks.pre_resolve(&arg.io, adapter_type, &mut nodes, root_project_quoting)?;
     let root_project_configs = build_root_project_configs(
         arg,
         dbt_state.root_project(),
@@ -368,6 +371,13 @@ pub async fn resolve(
 
     // Check access
     let nodes_with_access_errors = check_access(arg, &nodes, &all_runtime_configs);
+    resolver_hooks.post_resolve(
+        &arg.io,
+        &mut nodes,
+        root_project_name,
+        root_project_quoting,
+        &dbt_state.cloud_config,
+    )?;
 
     // Set the project name on nodes so that `package:this` selectors can resolve
     nodes.project_name = Some(root_project_name.to_string());
@@ -404,6 +414,7 @@ pub async fn resolve(
             get_columns_in_relation_calls,
             patterned_dangling_sources,
             runtime_config: root_runtime_config.clone(),
+            manifest_path_configs: ManifestPathConfig::for_packages(&dbt_state.packages),
             manifest_selectors,
             resolved_selectors,
             root_project_quoting: root_project_quoting.try_into()?,
@@ -1239,7 +1250,7 @@ mod tests {
                 name: "__overview__".to_string(),
                 package_name: "dbt".to_string(),
                 path: PathBuf::from("overview.md"),
-                original_file_path: PathBuf::from("overview.md"),
+                original_file_path: PathBuf::from("docs/overview.md"),
                 unique_id: overview_uid,
                 block_contents: DEFAULT_OVERVIEW_CONTENTS.to_string(),
             });

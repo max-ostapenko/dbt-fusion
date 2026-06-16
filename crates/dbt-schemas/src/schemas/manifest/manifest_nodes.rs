@@ -4,6 +4,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use serde::{Deserialize, Serialize, de::Deserializer};
 use serde_with::skip_serializing_none;
 
+use crate::schemas::common::ExternalTable;
 use crate::schemas::serde::OmissibleGrantConfig;
 use dbt_common::io_args::ComputeArg;
 use dbt_common::serde_utils::Omissible;
@@ -148,6 +149,7 @@ pub struct ManifestNodeBaseAttributes {
         deserialize_with = "deserialize_dbt_columns"
     )]
     pub columns: Vec<DbtColumnRef>,
+    #[serde(default)]
     pub depends_on: NodeDependsOn,
     #[serde(default)]
     pub refs: Vec<DbtRef>,
@@ -193,6 +195,7 @@ pub struct ManifestSeed {
     pub __base_attr__: ManifestNodeBaseAttributes,
 
     // Test Specific Attributes
+    #[serde(default)]
     pub config: ManifestSeedConfig,
     pub root_path: Option<PathBuf>,
 
@@ -255,6 +258,7 @@ pub struct ManifestUnitTest {
 
     pub __base_attr__: ManifestNodeBaseAttributes,
     /// Unit Test Specific Attributes
+    #[serde(default)]
     pub config: UnitTestConfig,
     pub model: String,
     pub given: Vec<Given>,
@@ -334,6 +338,7 @@ pub struct ManifestDataTest {
     pub __base_attr__: ManifestNodeBaseAttributes,
 
     /// Test Specific Attributes
+    #[serde(default)]
     pub config: DataTestConfig,
     pub column_name: Option<String>,
     pub attached_node: Option<String>,
@@ -575,6 +580,7 @@ pub struct ManifestSnapshot {
     pub __base_attr__: ManifestNodeBaseAttributes,
 
     /// Snapshot Specific Attributes
+    #[serde(default)]
     pub config: ManifestSnapshotConfig,
 
     pub __other__: BTreeMap<String, YmlValue>,
@@ -638,10 +644,12 @@ pub struct ManifestSource {
     pub identifier: String,
     pub source_name: String,
     #[serde(
+        default,
         serialize_with = "serialize_dbt_columns",
         deserialize_with = "deserialize_dbt_columns"
     )]
     pub columns: Vec<DbtColumnRef>,
+    #[serde(default)]
     pub config: SourceConfig,
     pub quoting: Option<DbtQuoting>,
     pub source_description: String,
@@ -655,6 +663,9 @@ pub struct ManifestSource {
 
     #[serialize_always]
     pub freshness: Option<FreshnessDefinition>,
+
+    #[serialize_always]
+    pub external: Option<ExternalTable>,
 
     pub __other__: BTreeMap<String, YmlValue>,
 }
@@ -681,12 +692,7 @@ impl From<DbtSource> for ManifestSource {
             source_name: source.__source_attr__.source_name,
             columns: source.__base_attr__.columns,
             config: source.deprecated_config,
-            quoting: Some(DbtQuoting {
-                database: Some(source.__base_attr__.quoting.database),
-                schema: Some(source.__base_attr__.quoting.schema),
-                identifier: Some(source.__base_attr__.quoting.identifier),
-                snowflake_ignore_case: None,
-            }),
+            quoting: source.__source_attr__.user_quoting,
             source_description: source.__source_attr__.source_description,
             unrendered_config: source.__base_attr__.unrendered_config,
             unrendered_database: source.__source_attr__.unrendered_database,
@@ -695,6 +701,7 @@ impl From<DbtSource> for ManifestSource {
             loaded_at_field: source.__source_attr__.loaded_at_field,
             loaded_at_query: source.__source_attr__.loaded_at_query,
             freshness: source.__source_attr__.freshness,
+            external: source.__source_attr__.external,
             __other__: source.__other__,
         }
     }
@@ -711,8 +718,10 @@ pub struct ManifestMacro {
     pub original_file_path: PathBuf,
     pub unique_id: String,
     pub macro_sql: String,
+    #[serde(default)]
     pub depends_on: MacroDependsOn,
     pub description: String,
+    #[serde(default)]
     pub meta: BTreeMap<String, YmlValue>,
     pub docs: Option<DocsConfig>,
     pub patch_path: Option<PathBuf>,
@@ -778,6 +787,7 @@ pub struct ManifestModel {
     // Model Specific Attributes
     pub access: Option<Access>,
     pub group: Option<String>,
+    #[serde(default)]
     pub config: ManifestModelConfig,
     pub version: Option<StringOrInteger>,
     pub latest_version: Option<StringOrInteger>,
@@ -1268,6 +1278,7 @@ pub struct ManifestAnalysis {
     #[serde(default)]
     pub quoting_ignore_case: bool,
     pub persist_docs: Option<PersistDocsConfig>,
+    #[serde(default)]
     pub config: AnalysesConfig,
 
     pub __other__: BTreeMap<String, YmlValue>,
@@ -1387,6 +1398,7 @@ pub struct ManifestFunction {
     pub __base_attr__: ManifestNodeBaseAttributes,
 
     // Function Specific Attributes
+    #[serde(default)]
     pub config: FunctionConfig,
     pub access: Access,
     pub group: Option<String>,
@@ -1406,6 +1418,7 @@ struct ManifestFunctionCompat {
 
     pub __base_attr__: ManifestNodeBaseAttributes,
 
+    #[serde(default)]
     pub config: FunctionConfig,
     pub access: Option<Access>,
     pub group: Option<String>,
@@ -1493,6 +1506,7 @@ impl From<DbtFunction> for ManifestFunction {
 #[serde(rename_all = "snake_case")]
 pub struct ManifestExposureNodeBaseAttributes {
     // Derived
+    #[serde(default)]
     pub depends_on: NodeDependsOn,
     #[serde(default)]
     pub refs: Vec<DbtRef>,
@@ -1524,6 +1538,7 @@ pub struct ManifestExposure {
     #[serde(rename = "type")]
     pub type_: ExposureType,
     pub url: Option<String>,
+    #[serde(default)]
     pub config: ExposureConfig,
 
     pub __other__: BTreeMap<String, YmlValue>,
@@ -1567,6 +1582,7 @@ impl From<DbtExposure> for ManifestExposure {
 #[serde(rename_all = "snake_case")]
 pub struct ManifestMetricNodeBaseAttributes {
     // Derived
+    #[serde(default)]
     pub depends_on: NodeDependsOn,
 
     #[serde(default)]
@@ -1598,6 +1614,7 @@ pub struct ManifestMetric {
     pub time_granularity: Option<Granularity>,
     pub group: Option<String>,
 
+    #[serde(default)]
     pub config: ManifestMetricConfig,
 
     #[serde(default)]
@@ -1654,6 +1671,17 @@ pub struct ManifestMetricConfig {
     pub group: Option<String>,
 }
 
+impl Default for ManifestMetricConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            meta: None,
+            tags: vec![],
+            group: None,
+        }
+    }
+}
+
 impl From<MetricConfig> for ManifestMetricConfig {
     fn from(config: MetricConfig) -> Self {
         Self {
@@ -1674,6 +1702,7 @@ impl From<MetricConfig> for ManifestMetricConfig {
 #[serde(rename_all = "snake_case")]
 pub struct ManifestSemanticModelNodeBaseAttributes {
     // Derived
+    #[serde(default)]
     pub depends_on: NodeDependsOn,
 
     #[serde(default)]
@@ -1694,6 +1723,16 @@ pub struct ManifestSemanticModelConfig {
     pub meta: Option<IndexMap<String, YmlValue>>,
 
     pub group: Option<String>,
+}
+
+impl Default for ManifestSemanticModelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            meta: None,
+            group: None,
+        }
+    }
 }
 
 impl From<SemanticModelConfig> for ManifestSemanticModelConfig {
@@ -1728,13 +1767,17 @@ pub struct ManifestSemanticModel {
     pub node_relation: Option<NodeRelation>,
     pub label: Option<String>,
     pub defaults: Option<SemanticModelDefaults>,
+    #[serde(default)]
     pub entities: Vec<SemanticEntity>,
+    #[serde(default)]
     pub measures: Vec<ManifestSemanticModelMeasure>,
+    #[serde(default)]
     pub dimensions: Vec<crate::schemas::common::Dimension>,
     pub metadata: Option<SourceFileMetadata>,
     pub primary_entity: Option<String>,
     pub group: Option<String>,
 
+    #[serde(default)]
     pub config: ManifestSemanticModelConfig,
 
     pub __other__: BTreeMap<String, YmlValue>,
@@ -1878,6 +1921,7 @@ impl From<ManifestSemanticModelMeasure> for SemanticMeasure {
 #[serde(rename_all = "snake_case")]
 pub struct ManifestSavedQueryNodeBaseAttributes {
     // Derived
+    #[serde(default)]
     pub depends_on: NodeDependsOn,
 
     #[serde(default)]

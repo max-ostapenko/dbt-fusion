@@ -8,7 +8,7 @@ members = [
   "crates/dbt-auth",
   "crates/dbt-base",
   "crates/dbt-clap-core",
-  "crates/dbt-cli-lib",
+  "crates/dbt-docs-core",
   "crates/dbt-docs-server",
   "crates/dbt-adapter-core",
   "crates/dbt-common",
@@ -23,12 +23,14 @@ members = [
   "crates/dbt-tasks-sa",
   "crates/dbt-init",
   "crates/dbt-index-core",
+  "crates/dbt-lineage-core",
   "crates/dbt-error",
   "crates/dbt-frontend-common",
   "crates/dbt-jinja/minijinja",
   "crates/minijinja-typecheck-builtins",
   "crates/dbt-jinja/minijinja-contrib",
   "crates/dbt-dag",
+  "crates/dbt-defer",
   "crates/dbt-loader",
   "crates/dbt-test-containers",
   "crates/dbt-parser",
@@ -39,6 +41,7 @@ members = [
   "crates/dbt-metadata",
   "crates/dbt-metadata-parquet",
   "crates/dbt-profile",
+  "crates/dbt-run-cache",
   "crates/dbt-schemas",
   "crates/dbt-schema-store",
   "crates/dbt-telemetry",
@@ -50,6 +53,7 @@ members = [
   "crates/dbt-adapter-sql",
   "crates/dbt-ident",
   "crates/dbt-jinja-utils",
+  "crates/dbt-main",
   "crates/dbt-sa-cli",
   "crates/dbt-xdbc",
   "crates/xdbc-record-replay",
@@ -74,6 +78,8 @@ members = [
   "crates/dbt-sql/dbt-sql-utils",
 
   "crates/dbt-ci",
+  "crates/dbt-login",
+  "crates/dbt-platform-auth",
 ]
 
 resolver = "2"
@@ -86,7 +92,7 @@ homepage = "https://getdbt.com"
 keywords = ["sql", "parquet", "json", "csv", "dbt"]
 license = "Elastic-2.0"
 repository = "https://github.com/dbt-labs/dbt-fusion"
-version = "2.0.0-preview.177"
+version = "2.0.0-preview.186"
 
 [patch.crates-io]
 
@@ -180,7 +186,7 @@ opt-level = 3
 lto = "thin"
 # Parallel compilation within a crate. See:
 # https://doc.rust-lang.org/cargo/reference/profiles.html#codegen-units
-codegen-units = 16
+codegen-units = 1
 
 # Used for Linux builds. Symbols are extracted by the CI build script.
 [profile.relwithdebinfo]
@@ -207,15 +213,16 @@ dbt-agate = { path = "crates/dbt-agate" }
 dbt-auth = { path = "crates/dbt-auth" }
 dbt-base = { path = "crates/dbt-base" }
 dbt-clap-core = { path = "crates/dbt-clap-core" }
-dbt-cli-lib = { path = "crates/dbt-cli-lib" }
 dbt-cloud-api = { path = "crates/dbt-cloud-api" }
 dbt-cloud-config = { path = "crates/dbt-cloud-config" }
 dbt-common = { path = "crates/dbt-common" }
 dbt-compilation = { path = "crates/dbt-compilation" }
 dbt-csv = { path = "crates/dbt-csv" }
 dbt-dag = { path = "crates/dbt-dag" }
+dbt-defer = { path = "crates/dbt-defer" }
 dbt-deps = { path = "crates/dbt-deps" }
 dbt-df-providers = { path = "crates/dbt-df-providers" }
+dbt-docs-core = { path = "crates/dbt-docs-core" }
 dbt-docs-server = { path = "crates/dbt-docs-server", default-features = false }
 dbt-env = { path = "crates/dbt-env" }
 dbt-error = { path = "crates/dbt-error" }
@@ -230,12 +237,17 @@ dbt-jinja-ctx = { path = "crates/dbt-jinja-ctx" }
 dbt-jinja-filters = { path = "crates/dbt-jinja-filters" }
 dbt-jinja-utils = { path = "crates/dbt-jinja-utils" }
 dbt-jinja-vars = { path = "crates/dbt-jinja-vars" }
+dbt-lineage-core = { path = "crates/dbt-lineage-core" }
 dbt-loader = { path = "crates/dbt-loader" }
+dbt-login = { path = "crates/dbt-login" }
+dbt-main = { path = "crates/dbt-main", default-features = false }
 dbt-metricflow = { path = "crates/dbt-metricflow" }
 dbt-parser = { path = "crates/dbt-parser" }
+dbt-platform-auth = { path = "crates/dbt-platform-auth" }
 dbt-pretty-table = { path = "crates/dbt-pretty-table" }
 dbt-proc-macros = { path = "crates/dbt-proc-macros" }
 dbt-profile = { path = "crates/dbt-profile" }
+dbt-run-cache = { path = "crates/dbt-run-cache" }
 dbt-scheduler = { path = "crates/dbt-scheduler" }
 
 dbt-metadata = { path = "crates/dbt-metadata" }
@@ -390,6 +402,7 @@ reqwest = { version = "0.12.9", default-features = false, features = [
   "charset",
   "gzip",
   "http2",
+  "json",
   "rustls-tls",
   "macos-system-configuration",
 ] }
@@ -426,11 +439,11 @@ scopeguard = { version = "1.2.0" }
 
 # io stuff
 clean-path = "0.2.1"
-console = "0.15.5"
+console = "0.16.3"
 csv = { version = "1.1", default-features = false }
-dialoguer = "0.11.0"
+dialoguer = "0.12.0"
 diffy = { version = "0.4.2" }
-dirs = "5.0.1"
+dirs = "6.0.0"
 dotenvy = "0.15"
 flate2 = "1.0.28"
 gix = { version = "0.72.1", default-features = false, features = ["revision"] }
@@ -476,14 +489,14 @@ tokio = { version = "1.41.1", features = [
   "time",
 ] }
 tokio-stream = "0.1.17"
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "compat"] }
 
 # atomic
 arc-swap = { version = "1.7.1" }
 
 # pretty
 comfy-table = { version = "7.1.1" }
-indicatif = { version = "0.17.11" }
+indicatif = { version = "0.18.4" }
 
 # repl
 rustyline = { version = "15.0.0", default-features = false, features = [
@@ -511,11 +524,13 @@ iana-time-zone = { version = "0.1.62" }
 im = "15.1.0"
 indexmap = "2.2.3"
 ini = "1.3.0"
-itertools = "0.13.0"
+itertools = "0.14.0"
 libc = "0.2"
 linked-hash-map = "0.5.6"
 linked_hash_set = "0.1.4"
 md5 = "0.7.0"
+normalize-path = "0.2.1"
+num-integer = "0.1.46"
 percent-encoding = "2.3.1"
 petgraph = "0.8.1"
 pkcs8 = { version = "0.10", features = ["pkcs5", "3des"] }
@@ -529,6 +544,7 @@ similar = "2.6"
 siphasher = { version = "1.0.1" }
 url = "2.5.4"
 ustr = "1.0.0"
+weak-table = "0.3.2"
 zstd-safe = "7"
 
 # testing
@@ -565,6 +581,12 @@ thiserror = "2"
 env_logger = "0.10" # To be removed
 
 # tracing (observability)
+# Versioning warning: dbt-labs/fs#6993 tried upgrading to tracing 0.1.43
+# and tracing-subscriber 0.3.22 for upstream perf improvements, but was
+# closed after the newer versions showed consistent degradation. Do not retry
+# that version pair casually. Any tracing/tracing-subscriber update needs
+# explicit local parse/compile/build/show perf testing beyond CI perf tests,
+# which are flaky at the time of writing.
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 
@@ -575,7 +597,7 @@ quote = "1"
 syn = { version = "2", features = ["full"] }
 
 # gRPC dependencies
-tonic = "0.14.1"
+tonic = { version = "0.14.1", features = ["transport", "tls-native-roots"] }
 tonic-build = "0.14.1"
 tonic-prost = "0.14.1"
 tonic-prost-build = "0.14.1"
@@ -585,6 +607,13 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 jsonwebtoken = { version = "9", features = ["use_pem"] }
 
 # OpenTelemetry (optional embedded OTLP exporter for traces, see dbt-common)
+# Keep the 0.30 OpenTelemetry crates in lockstep. opentelemetry-proto 0.30.1
+# changed its generated structs from prost 0.13 to prost 0.14 while
+# opentelemetry-otlp 0.30.0 still used prost 0.13, breaking fresh resolves;
+# see dbt-labs/fs#5773 and open-telemetry/opentelemetry-rust#3169. The exact
+# proto pin is a 0.30-line workaround, not a restriction on fs using prost 0.14.
+# Any OpenTelemetry update must test a fresh Cargo.lock resolve plus OTLP
+# exporter serialization/shutdown behavior.
 opentelemetry = "0.30.0"
 opentelemetry-otlp = "0.30.0"
 opentelemetry-proto = "=0.30.0"
@@ -600,6 +629,7 @@ unicode-segmentation = "1.12"
 
 # axum dependency
 axum = "0.8.5"
+tower = "0.5.2"
 tower-http = { version = "0.6", features = ["trace"] }
 
 # system browser opener
@@ -621,6 +651,13 @@ inefficient_to_string = "warn"
 or_fun_call = "warn"
 unnecessary_lazy_evaluations = "warn"
 collapsible_if = "allow"
+too_many_arguments = "allow"
+# we have many structs that start with a parameter-less constructor,
+# but quickly grow to take more injected dependencies. If we start with
+# a Default::default() constructor, people (and Claude) get the
+# twisted idea that they should still maintain the Default::default()
+# instead of always taking the injected dependencies as parameters.
+new_without_default = "allow"
 
 [workspace.lints.rust]
 unused_qualifications = "warn"

@@ -15,11 +15,12 @@ arrow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-dbt-cli-lib = { workspace = true }
+dbt-clap-core = { workspace = true }
 dbt-cloud-config = { workspace = true }
 dbt-common = { workspace = true }
 dbt-features = { workspace = true }
 dbt-fusion-workspace-hack = { version = "0.1" }
+dbt-main = { workspace = true }
 dbt-profile = { workspace = true }
 dbt-schemas = { workspace = true }
 dbt-telemetry = { workspace = true }

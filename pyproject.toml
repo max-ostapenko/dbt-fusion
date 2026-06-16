@@ -2,7 +2,8 @@
 
 [project]
 name = "dbt-sa-cli"
-description = "dbt Fusion standalone analyzer CLI"
+dynamic = ["version"]
+description = "Build analytics the way engineers build applications"
 authors = [{ name = "dbt Labs", email = "info@dbtlabs.com" }]
 readme = "README.md"
 requires-python = ">=3.9"

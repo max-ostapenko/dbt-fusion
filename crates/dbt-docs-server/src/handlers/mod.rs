@@ -15,11 +15,12 @@ pub mod pagination;
 pub mod project;
 pub mod query;
 pub mod saved_queries;
+pub mod search;
 pub mod seeds;
 pub mod semantic_models;
 pub mod snapshots;
 pub mod sources;
-pub mod tests;
 
 pub(crate) mod json;
 mod sql;
+pub mod tests;

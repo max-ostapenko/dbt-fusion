@@ -171,6 +171,7 @@ pub enum FsCommand {
     Clone,
     System,
     Man,
+    Login,
     Debug,
     Retry,
     Docs,
@@ -200,6 +201,7 @@ impl FsCommand {
             FsCommand::Clone => "clone",
             FsCommand::System => "system",
             FsCommand::Man => "man",
+            FsCommand::Login => "login",
             FsCommand::Debug => "debug",
             FsCommand::Retry => "retry",
             FsCommand::Docs => "docs",
@@ -496,8 +498,9 @@ pub struct EvalArgs {
     pub state: Option<PathBuf>,
     pub defer_state: Option<PathBuf>,
     pub connection: bool,
-    pub macro_name: String,
+    pub macro_name: Option<String>,
     pub macro_args: BTreeMap<String, Value>,
+    pub macro_sql: Option<String>,
     pub warn_error: Option<bool>,
     pub warn_error_options: WarnErrorOptions,
     pub version_check: bool,
@@ -529,12 +532,18 @@ pub struct EvalArgs {
     pub skip_post_hooks: bool,
     /// Write metadata parquet epoch files (parse/nodes, compile/nodes, compile/columns, etc.)
     pub write_metadata: bool,
+    /// Also write snapshot index parquet to target/index/ (implies write_metadata)
+    pub write_index: bool,
+    /// Directory for index parquet output (default: <target>/index/)
+    pub index_dir: Option<PathBuf>,
     /// Directory for metadata parquet output (default: <target>/metadata/)
     pub metadata_dir: Option<PathBuf>,
     /// Whether to skip creating generic tests
     pub skip_creating_generic_tests: bool,
-    /// Compute and write column-level lineage into compile/cll parquet (requires --metadata and --static-analysis strict)
+    /// Compute and write column-level lineage into compile/cll parquet (requires --write-metadata and --static-analysis strict)
     pub write_lineage: bool,
+    /// Always enable the linter.
+    pub force_enable_linter: bool,
 }
 impl fmt::Debug for EvalArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -673,6 +682,13 @@ impl EvalArgs {
         self.metadata_dir
             .clone()
             .unwrap_or_else(|| self.io.out_dir.join(DBT_METADATA_DIR_NAME))
+    }
+
+    /// Resolves the index output directory: `--index-dir` if set, else `<out_dir>/index`.
+    pub fn index_dir(&self) -> PathBuf {
+        self.index_dir
+            .clone()
+            .unwrap_or_else(|| self.io.out_dir.join("index"))
     }
 
     // this could accept a SelectExpression in case we want to join more complex selections together.

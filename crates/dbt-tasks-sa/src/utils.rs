@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
@@ -17,7 +18,6 @@ use dbt_common::unexpected_err;
 use dbt_common::{ErrorCode, FsResult, constants::DBT_COMPILED_DIR_NAME, fs_err, stdfs};
 use dbt_dag::schedule::Schedule;
 use dbt_jinja_utils::jinja_environment::JinjaEnv;
-use dbt_parser::utils::get_original_file_contents;
 use dbt_schema_store::{CanonicalFqn, SchemaStoreTrait};
 use dbt_schemas::schemas::common::DbtMaterialization;
 use dbt_schemas::schemas::dbt_column::{DbtColumn, DbtColumnRef};
@@ -73,39 +73,16 @@ fn update_resolved_states_manifest_with_schemas_and_compiled_sql_core(
             },
         };
 
-        let mut base_mut = match manifest_model.as_mut() {
+        let base_mut = match manifest_model.as_mut() {
             None => None,
             Some(manifest_model) => Some(&mut manifest_model.__base_attr__),
         };
 
-        // Only populate raw_code/compiled_code into the manifest when writing manifest.json
-        // or metadata parquet (compile/nodes epoch needs compiled_code and compiled_path).
+        // Only populate compiled_code into the manifest when writing manifest.json or metadata
+        // parquet (compile/nodes epoch needs compiled_code and compiled_path).
         // Skipping this avoids reading 5k+ compiled SQL files from disk otherwise.
+        // raw_code is already populated at resolve time — see resolve_models.rs.
         if arg.write_json || arg.write_metadata {
-            let model_extension = model
-                .original_file_path()
-                .extension()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if arg.write_json {
-                if model_extension == "sql" || model_extension == "py" {
-                    if let Some(base_mut) = base_mut.as_mut() {
-                        base_mut.raw_code =
-                            get_original_file_contents(&io.in_dir, &model.original_file_path());
-                    }
-                } else {
-                    emit_warn_log_message(
-                        ErrorCode::Generic,
-                        format!(
-                            "Tried serializing model {} raw_code but it is not a SQL or Python model: {}",
-                            unique_id,
-                            model.original_file_path().display()
-                        ),
-                        io.status_reporter.as_ref(),
-                    );
-                };
-            }
-
             if let Some(base_mut) = base_mut {
                 let absolute_path = get_target_write_path(
                     &io.in_dir,
@@ -166,37 +143,14 @@ fn update_resolved_states_manifest_with_schemas_and_compiled_sql_core(
             },
         };
 
-        let mut base_mut = match manifest_snapshot {
+        let base_mut = match manifest_snapshot {
             None => None,
             Some(manifest_snapshot) => Some(&mut manifest_snapshot.__base_attr__),
         };
 
-        // Only populate raw_code/compiled_code when writing manifest.json or metadata parquet.
+        // Only populate compiled_code into the manifest when writing manifest.json or metadata
+        // parquet. raw_code is already populated at resolve time — see resolve_snapshots.rs.
         if arg.write_json || arg.write_metadata {
-            let snapshot_extension = snapshot
-                .original_file_path()
-                .extension()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if arg.write_json {
-                if snapshot_extension == "sql" {
-                    if let Some(base_mut) = base_mut.as_mut() {
-                        base_mut.raw_code =
-                            get_original_file_contents(&io.in_dir, &snapshot.original_file_path());
-                    }
-                } else if snapshot_extension != "yml" && snapshot_extension != "yaml" {
-                    emit_warn_log_message(
-                        ErrorCode::Generic,
-                        format!(
-                            "Tried serializing snapshot {} raw_code but it is not of either SQL or YAML/YML: {}",
-                            unique_id,
-                            snapshot.original_file_path().display()
-                        ),
-                        io.status_reporter.as_ref(),
-                    );
-                };
-            }
-
             if let Some(base_mut) = base_mut {
                 // Always use nested path for snapshots — mirrors task_runner and materialize_snapshot.
                 // Must stay in sync with DefaultCompiledSqlCache::get_compiled_sql_path.
@@ -440,6 +394,9 @@ pub fn update_node_columns(
             deprecated_config: existing
                 .map(|col| col.deprecated_config.clone())
                 .unwrap_or_default(),
+            dimension: existing.and_then(|col| col.dimension.clone()),
+            entity: existing.and_then(|col| col.entity.clone()),
+            granularity: existing.and_then(|col| col.granularity.clone()),
         });
 
         new_columns.push(new_column);
@@ -607,26 +564,35 @@ pub fn filter_missing_schemas(
             catalog,
             ComponentName::Database,
         );
-        if let Ok(schemas_values) = adapter
-            .list_schemas(state, &quoted_catalog)
-            .and_then(|value| value.try_iter())
-        {
-            let existing_schemas = BTreeSet::<String>::from_iter(
-                schemas_values.map(|value| value.to_string().to_lowercase()),
-            );
-            missing_catalog_schemas.extend(schemas.iter().filter_map(|(schema, unique_id)| {
-                if existing_schemas.contains(&schema.to_lowercase()) {
-                    None
-                } else {
-                    Some((catalog.clone(), schema.clone(), unique_id.clone()))
-                }
-            }));
-        } else {
-            missing_catalog_schemas.extend(
-                schemas.iter().map(|(schema, unique_id)| {
+        match adapter.list_schemas_typed(state, &quoted_catalog) {
+            Ok(schemas_values) => {
+                let existing_schemas = BTreeSet::<String>::from_iter(
+                    schemas_values.into_iter().map(|s| s.to_lowercase()),
+                );
+                missing_catalog_schemas.extend(schemas.iter().filter_map(|(schema, unique_id)| {
+                    if existing_schemas.contains(&schema.to_lowercase()) {
+                        None
+                    } else {
+                        Some((catalog.clone(), schema.clone(), unique_id.clone()))
+                    }
+                }));
+            }
+            // Fail fast on this Snowflake driver error,
+            // this indicates that the driver times out on the http request from the server
+            // after default number if retries in gosnowflake
+            // TODO: see if we can represent irrecoverable errors like this one using ErrorKind etc.
+            // we cannot currently because the ErrorKind::Driver is too inclusive that contain errors we want to ignore
+            Err(err)
+                if err.to_string().contains("context deadline exceeded")
+                    && adapter.adapter_type() == AdapterType::Snowflake =>
+            {
+                return Err(err);
+            }
+            Err(_) => {
+                missing_catalog_schemas.extend(schemas.iter().map(|(schema, unique_id)| {
                     (catalog.clone(), schema.clone(), unique_id.clone())
-                }),
-            );
+                }));
+            }
         }
     }
 
@@ -634,7 +600,7 @@ pub fn filter_missing_schemas(
 }
 
 pub fn mirror_schema_to_frontier_cache(
-    io_args: &IoArgs,
+    io_args_out_dir: &Path,
     canonical_fqn: &CanonicalFqn,
     unique_id: &str,
     schema_store: &dyn SchemaStoreTrait,
@@ -654,7 +620,7 @@ pub fn mirror_schema_to_frontier_cache(
     // For legacy per-file formats (StoreFormat::Parquet), copy the analyzed
     // parquet file to the sourced_remote path. This is a no-op for ParquetCache
     // because the analyzed file no longer exists on disk.
-    let schema_root = io_args.out_dir.join("schemas");
+    let schema_root = io_args_out_dir.join("schemas");
     let analyzed_path = schema_root
         .join("analyzed")
         .join(unique_id)
@@ -694,7 +660,7 @@ pub fn mirror_schema_to_frontier_cache(
 }
 
 pub fn typecheck_macros(
-    resolver_state: Arc<ResolverState>,
+    resolver_state: &ResolverState,
     env: Arc<JinjaEnv>,
     jinja_typechecking_listener_factory: Arc<
         dyn dbt_jinja_utils::listener::JinjaTypeCheckingEventListenerFactory,
@@ -825,7 +791,7 @@ fn collect_noqa_comments(
 /// Write decompiled SQL to out_dir/decompiled/{path}
 /// Mirrors dbt's compiled output structure. Path should be the common.path from the node
 /// (e.g., "models/staging/stg_users.sql")
-pub fn write_decompiled_sql(out_dir: &std::path::Path, relative_path: &std::path::Path, sql: &str) {
+pub fn write_decompiled_sql(out_dir: &Path, relative_path: &Path, sql: &str) {
     let decompiled_path = out_dir.join("decompiled").join(relative_path);
 
     if let Some(parent) = decompiled_path.parent() {

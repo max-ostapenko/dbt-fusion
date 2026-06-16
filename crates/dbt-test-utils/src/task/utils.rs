@@ -2,9 +2,10 @@ use super::TestResult;
 use super::log_capture::JsonLogEvent;
 use crate::task::env::TracingReloadHandle;
 use crate::task::task_seq::FeatureStackFactory;
-use dbt_cli_lib::ctrl_c::run_future_with_ctrlc_support;
+use dbt_clap_core::{Cli, CliParser};
 use dbt_common::cancellation::CancellationToken;
-use dbt_common::{FsError, cli_parser_trait::CliParserTrait, tracing::FsTraceConfig};
+use dbt_common::{FsError, tracing::FsTraceConfig};
+use dbt_lib::ctrl_c::run_future_with_ctrlc_support;
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::{
@@ -342,15 +343,16 @@ pub fn strip_leading_relative(path: &Path) -> &Path {
 
 // Util function to execute fusion commands in tests
 #[allow(clippy::too_many_arguments)]
-pub fn exec_fs<'a, P: CliParserTrait + Default, Fut>(
+pub fn exec_fs<'a, Fut>(
     feature_stack_factory: Arc<FeatureStackFactory>,
+    parser: &CliParser,
     cmd_vec: Vec<String>,
     project_dir: PathBuf,
     target_dir: PathBuf,
     stdout_file: File,
     stderr_file: File,
-    execute_fs: impl FnOnce(SystemArgs, Box<P::CliType>, Arc<FeatureStack>, CancellationToken) -> Fut,
-    from_lib: impl FnOnce(&P::CliType) -> SystemArgs,
+    execute_fs: impl FnOnce(SystemArgs, Box<Cli>, Arc<FeatureStack>, CancellationToken) -> Fut,
+    from_lib: impl FnOnce(&Cli) -> SystemArgs,
     tracing_handle: TracingReloadHandle,
 ) -> Pin<Box<dyn Future<Output = FsResult<()>> + Send + 'a>>
 where
@@ -364,11 +366,49 @@ where
         dotenvy::from_path(conformance_file).unwrap();
     }
 
-    let parser = P::default();
     let cli = parser.parse_from(cmd_vec);
+    exec_cli(
+        feature_stack_factory,
+        cli,
+        project_dir,
+        target_dir,
+        stdout_file,
+        stderr_file,
+        execute_fs,
+        from_lib,
+        tracing_handle,
+    )
+}
+
+// Util function to execute fusion commands in tests from an already-parsed
+// `Cli`. This is everything `exec_fs` does *after* argv parsing; `exec_fs`
+// delegates to it. It exists so callers whose argv does not parse into the
+// platform `Cli` directly can still reuse
+// the redirect / ctrl-c / telemetry-shutdown plumbing.
+//
+// Unlike `exec_fs`, this does NOT load `.env.conformance`: that has to happen
+// before argv parsing, which by definition is already done by the time a `Cli`
+// exists. Callers that need it must load it before parsing.
+#[allow(clippy::too_many_arguments)]
+pub fn exec_cli<'a, Fut>(
+    feature_stack_factory: Arc<FeatureStackFactory>,
+    cli: Box<Cli>,
+    project_dir: PathBuf,
+    target_dir: PathBuf,
+    stdout_file: File,
+    stderr_file: File,
+    execute_fs: impl FnOnce(SystemArgs, Box<Cli>, Arc<FeatureStack>, CancellationToken) -> Fut,
+    from_lib: impl FnOnce(&Cli) -> SystemArgs,
+    tracing_handle: TracingReloadHandle,
+) -> Pin<Box<dyn Future<Output = FsResult<()>> + Send + 'a>>
+where
+    Fut: Future<Output = FsResult<()>> + Send + 'a,
+{
     let arg = from_lib(&cli);
-    let warn_error_options = parser.warn_error_options(&cli);
-    let fail_fast_flag = parser.fail_fast_flag(&cli);
+    // Equivalent to `CliParser::warn_error_options(&cli)`, computed directly so
+    // this helper does not need a `CliParser`.
+    let warn_error_options = Some(cli.common_args.get_cli_warn_error_options());
+    let fail_fast_flag = cli.common_args.fail_fast;
     let trace_config = FsTraceConfig::new_from_io_args(
         arg.command,
         Some(&project_dir),
@@ -388,8 +428,8 @@ where
     tracing_handle.with_tracing_consumer(middlewares, consumer_layers);
 
     let feature_stack = feature_stack_factory(feature_handle);
-    let cst = feature_stack.cancellation_token_source.clone();
-    let fail_fast = feature_stack.fail_fast.clone();
+    let cst = feature_stack.cli.cancellation_token_source.clone();
+    let fail_fast = feature_stack.cli.fail_fast.clone();
     let token = cst.token();
 
     let future = Box::pin(execute_fs(arg, cli, feature_stack, token));

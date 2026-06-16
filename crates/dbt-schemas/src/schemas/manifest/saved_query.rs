@@ -44,6 +44,7 @@ pub struct SavedQueryParams {
     pub group_by: Vec<String>,
     #[serde(rename = "where")]
     pub where_: Option<WhereFilterIntersection>,
+    #[serde(default)]
     pub order_by: Vec<String>,
     pub limit: Option<i32>,
 }
@@ -52,6 +53,7 @@ pub struct SavedQueryParams {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct SavedQueryExport {
     pub name: String,
+    #[serde(default)]
     pub config: SavedQueryExportConfig,
     pub unrendered_config: BTreeMap<String, YmlValue>,
 }

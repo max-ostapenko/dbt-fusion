@@ -4,6 +4,7 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::providers::Providers;
+pub use dbt_docs_core::DistInfo;
 
 /// Shared application state held by the axum router.
 pub struct AppState {
@@ -21,14 +22,6 @@ pub struct Capabilities {
     pub has_column_lineage: bool,
 }
 
-/// Metadata about the running distribution. Returned by `GET /api/v1/distribution`.
-#[derive(Debug, Clone, Serialize)]
-pub struct DistInfo {
-    pub name: String,
-    pub version: &'static str,
-    pub is_logged_in: bool,
-}
-
 impl AppState {
     pub fn new(index_dir: PathBuf, providers: Providers) -> Self {
         Self {
@@ -42,7 +35,7 @@ impl AppState {
     }
 
     pub fn server_version(&self) -> &'static str {
-        self.providers.dist_info.dist_info().version
+        env!("CARGO_PKG_VERSION")
     }
 
     pub fn has_column_lineage(&self) -> bool {

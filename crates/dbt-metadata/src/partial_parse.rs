@@ -68,14 +68,14 @@ use dbt_common::{
     node_selector::{IndirectSelection, MethodName, SelectExpression},
     path::DbtPath,
 };
-use dbt_jinja_vars::DbtVars;
+use dbt_jinja_vars::{DEFAULT_ENV_PLACEHOLDER, DbtVars};
 use dbt_schemas::{
     schemas::{
         Nodes, common::ResolvedQuoting, macros::DbtDocsMacro, relations::base::RelationPattern,
     },
     state::{
-        DbtPackage, DbtProfile, DbtState, GetRelationCalls, Macros, Operations, ResolverState,
-        ResourcePathKind,
+        DbtPackage, DbtProfile, DbtState, GetRelationCalls, Macros, ManifestPathConfig, Operations,
+        ResolverState, ResourcePathKind,
     },
 };
 use indexmap::IndexMap;
@@ -86,7 +86,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const INCREMENTAL_STATE_VERSION: u32 = 2;
+const INCREMENTAL_STATE_VERSION: u32 = 3;
 
 pub struct IncrementalState {
     pub version: u32,
@@ -101,6 +101,11 @@ pub struct IncrementalState {
     pub project_file_hash: String,
     /// blake3 hash of serialized CLI --vars — catches variable overrides between invocations.
     pub cli_vars_hash: String,
+    /// blake3 hash of `package-lock.yml` bytes.
+    /// Covers all pinned dep types (hub, git, tarball, private). When unchanged,
+    /// dep macro files are guaranteed identical — no file scanning needed.
+    /// Empty string when no lock file exists (new project / local-only deps).
+    pub packages_lock_hash: String,
     pub dbt_profile: DbtProfile,
     pub vars: BTreeMap<String, IndexMap<String, DbtVars>>,
     pub nodes: Nodes,
@@ -154,10 +159,21 @@ impl IncrementalState {
             if self.project_file_hash != hash_file_at_path(&project_path) {
                 return Some("dbt_project.yml content changed");
             }
+            // package-lock.yml covers all pinned dep types (hub, git, tarball, private).
+            // Any `dbt deps` run rewrites this file → hash changes → full re-parse.
+            // We skip the check when no lock file existed at save time (empty hash).
+            let lock_path = root_path.join("package-lock.yml");
+            let current_lock_hash = hash_file_at_path(&lock_path);
+            if !self.packages_lock_hash.is_empty() && self.packages_lock_hash != current_lock_hash {
+                return Some("package-lock.yml changed");
+            }
         }
         for (name, old_value) in &self.env_vars {
             match std::env::var(name) {
                 Ok(current) if current != *old_value => return Some("env var changed"),
+                // env_var(name, default) records DEFAULT_ENV_PLACEHOLDER when name is unset;
+                // a still-unset var is unchanged, not removed.
+                Err(_) if old_value == DEFAULT_ENV_PLACEHOLDER => {}
                 Err(_) => return Some("env var removed"),
                 _ => {}
             }
@@ -176,9 +192,23 @@ impl IncrementalState {
     /// the incremental pipeline either cannot handle it or would silently drop
     /// the change (e.g. `.md` docs are ignored by `compute_file_changeset`).
     pub fn needs_full_parse(&self) -> Option<&'static str> {
-        for pkg in &self.packages {
+        for (i, pkg) in self.packages.iter().enumerate() {
+            // Non-root, non-local deps (hub/git/tarball/private) are pinned by
+            // package-lock.yml. validate() already checked that hash, so if we
+            // reach here the lock file is unchanged → their files are unchanged.
+            // Skip file-level scanning for these packages entirely.
+            if i > 0 && !pkg.is_local_dep {
+                continue;
+            }
             let root = Path::new(&pkg.package_root_path);
             for (kind, files) in &pkg.all_paths {
+                // Profile changes are covered by `profile_file_hash` in validate(); the
+                // path stored here is not reliably project-relative (it can escape via
+                // `..` when ~/.dbt/profiles.yml is in use, and DbtPath normalisation
+                // strips the `..` segments), so don't stat it.
+                if *kind == ResourcePathKind::ProfilePaths {
+                    continue;
+                }
                 let kind_safe_for_incremental = matches!(
                     kind,
                     ResourcePathKind::ModelPaths | ResourcePathKind::AnalysisPaths
@@ -338,8 +368,16 @@ pub fn hash_file_at_path(path: &Path) -> String {
 pub struct PackageSnapshot {
     pub package_root_path: String,
     pub package_name: String,
+    #[serde(default)]
+    pub manifest_path_config: ManifestPathConfig,
     pub all_paths: HashMap<ResourcePathKind, Vec<(String, u64)>>,
     pub dependencies: BTreeSet<String>,
+    /// True when this is a local-path dep (`local: ../foo`).
+    /// Local deps are not pinned by `package-lock.yml` so their files must be
+    /// scanned by mtime. Hub / git / tarball / private deps are pinned and
+    /// covered by the lock-file hash — no file scanning needed for those.
+    #[serde(default)]
+    pub is_local_dep: bool,
 }
 
 fn system_time_to_nanos(t: SystemTime) -> u64 {
@@ -487,15 +525,23 @@ pub fn save_parse_state(
     let packages = snapshot_packages(dbt_state);
     let git_info =
         read_git_info(project_file_path.parent().unwrap_or(&project_file_path)).unwrap_or_default();
+    let lock_file_path = project_file_path
+        .parent()
+        .map(|p| p.join("package-lock.yml"))
+        .unwrap_or_default();
+    let packages_lock_hash = hash_file_at_path(&lock_file_path);
 
     crate::parse_state::save(&crate::parse_state::SaveArgs {
         out_dir: &io.out_dir,
         version: INCREMENTAL_STATE_VERSION,
         dbt_version: &current_dbt_version(),
+        project_name: packages.first().map_or("", |p| p.package_name.as_str()),
+        adapter_type: dbt_state.dbt_profile.db_config.adapter_type().into(),
         profile_hash: &dbt_state.dbt_profile.blake3_hash(),
         profile_file_hash: &hash_file_at_path(&profile_file_path),
         project_file_hash: &hash_file_at_path(&project_file_path),
         cli_vars_hash: &hash_cli_vars(cli_vars),
+        packages_lock_hash: &packages_lock_hash,
         dbt_profile_json: &dbt_profile_json,
         vars_json: &vars_json,
         env_vars_json: &env_vars_json,
@@ -888,6 +934,7 @@ pub fn load_parse_state_filtered_with_unique_ids(
         profile_file_hash: loaded.profile_file_hash,
         project_file_hash: loaded.project_file_hash,
         cli_vars_hash: loaded.cli_vars_hash,
+        packages_lock_hash: loaded.packages_lock_hash,
         dbt_profile,
         vars,
         nodes: loaded.nodes,
@@ -917,6 +964,10 @@ pub fn load_parse_state_filtered_with_unique_ids(
 pub fn dbt_packages_have_no_file_changes(packages: &[DbtPackage]) -> bool {
     for pkg in packages {
         for (kind, files) in &pkg.all_paths {
+            // See needs_full_parse for why ProfilePaths must be skipped.
+            if *kind == ResourcePathKind::ProfilePaths {
+                continue;
+            }
             let is_docs_path = *kind == ResourcePathKind::DocsPaths;
             for (dbt_path, saved_time) in files {
                 if is_docs_path
@@ -1065,6 +1116,7 @@ mod tests {
         DbtProfile {
             profile: "test".into(),
             target: "dev".into(),
+            defer_to_target: None,
             db_config: DbConfig::Datafusion(Box::new(DatafusionDbConfig {
                 database: Some("testdb".into()),
                 schema: Some("public".into()),
@@ -1085,6 +1137,7 @@ mod tests {
             packages: vec![PackageSnapshot {
                 package_root_path: "/tmp/project".into(),
                 package_name: "my_project".into(),
+                manifest_path_config: ManifestPathConfig::default(),
                 all_paths: HashMap::from([(
                     ResourcePathKind::ModelPaths,
                     vec![
@@ -1093,11 +1146,13 @@ mod tests {
                     ],
                 )]),
                 dependencies: BTreeSet::from(["dep_a".into()]),
+                is_local_dep: false,
             }],
             profile_hash: profile.blake3_hash(),
             profile_file_hash: hash_file_at_path(Path::new("/nonexistent")),
             project_file_hash: hash_file_at_path(Path::new("/nonexistent")),
             cli_vars_hash: hash_cli_vars(&None),
+            packages_lock_hash: String::new(),
             dbt_profile: profile,
             vars: Default::default(),
             nodes: Nodes::default(),
@@ -1135,7 +1190,12 @@ mod tests {
 
         let profile = test_profile();
         let packages = vec![DbtPackage {
-            dbt_project: serde_json::from_value(serde_json::json!({"name": "my_project"})).unwrap(),
+            dbt_project: serde_json::from_value(serde_json::json!({
+                "name": "my_project",
+                "model-paths": ["models", "custom_models"],
+                "test-paths": ["tests"]
+            }))
+            .unwrap(),
             package_root_path: PathBuf::from("/tmp/project"),
             dbt_properties: vec![],
             analysis_files: vec![],
@@ -1196,6 +1256,14 @@ mod tests {
         assert_eq!(loaded.version, INCREMENTAL_STATE_VERSION);
         assert_eq!(loaded.packages.len(), 1);
         assert_eq!(loaded.packages[0].package_name, "my_project");
+        assert_eq!(
+            loaded.packages[0].manifest_path_config.model_paths,
+            vec!["models", "custom_models"]
+        );
+        assert_eq!(
+            loaded.packages[0].manifest_path_config.test_paths,
+            vec!["tests"]
+        );
         assert!(loaded.nodes_with_resolution_errors.contains("err_node"));
 
         // Reconstruct package metadata and verify paths survive
@@ -1242,32 +1310,9 @@ mod tests {
         };
         // Write a cache with a bogus version; load should discard it.
         save(&SaveArgs {
-            out_dir: &io.out_dir,
             version: 9999,
             dbt_version: &current_dbt_version(),
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
-            dbt_profile_json: "{}",
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
-            nodes: &Nodes::default(),
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(&io.out_dir)
         })
         .expect("save");
         assert!(
@@ -1285,32 +1330,9 @@ mod tests {
             ..IoArgs::default()
         };
         save(&SaveArgs {
-            out_dir: &io.out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: "old-version-0.0.0",
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
-            dbt_profile_json: "{}",
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
-            nodes: &Nodes::default(),
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(&io.out_dir)
         })
         .expect("save");
         assert!(
@@ -1532,6 +1554,59 @@ mod tests {
         );
     }
 
+    /// G-2: package-lock.yml content change invalidates the cache.
+    /// `packages_lock_hash` is stored at save time; if the file changes (e.g.
+    /// after `dbt deps`) validate() must return Some so a full re-parse runs.
+    #[test]
+    fn validate_invalidates_on_package_lock_yml_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("profiles.yml"), b"profile: v1").unwrap();
+        std::fs::write(tmp.path().join("dbt_project.yml"), b"project: v1").unwrap();
+        std::fs::write(
+            tmp.path().join("package-lock.yml"),
+            b"packages:\n- package: dbt-labs/dbt_utils\n  version: 1.3.0\n",
+        )
+        .unwrap();
+        let mut state = state_for_validation(tmp.path());
+        state.packages_lock_hash = hash_file_at_path(&tmp.path().join("package-lock.yml"));
+        assert!(state.validate(&None).is_none(), "baseline: valid");
+
+        // Simulate `dbt deps` rewriting the lock file with a new version.
+        std::fs::write(
+            tmp.path().join("package-lock.yml"),
+            b"packages:\n- package: dbt-labs/dbt_utils\n  version: 1.4.0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            state.validate(&None),
+            Some("package-lock.yml changed"),
+            "package-lock.yml change must invalidate the parse cache"
+        );
+    }
+
+    /// G-6: when `packages_lock_hash` is empty (no lock file at save time),
+    /// the check is skipped — projects without deps and new projects are unaffected.
+    #[test]
+    fn validate_skips_package_lock_check_when_hash_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("profiles.yml"), b"profile: v1").unwrap();
+        std::fs::write(tmp.path().join("dbt_project.yml"), b"project: v1").unwrap();
+        // state_for_validation leaves packages_lock_hash as String::new() (empty).
+        let state = state_for_validation(tmp.path());
+        assert!(state.packages_lock_hash.is_empty(), "precondition");
+
+        // Even if a lock file now exists, the empty-hash state must not invalidate.
+        std::fs::write(
+            tmp.path().join("package-lock.yml"),
+            b"packages:\n- package: dbt-labs/dbt_utils\n  version: 1.3.0\n",
+        )
+        .unwrap();
+        assert!(
+            state.validate(&None).is_none(),
+            "empty packages_lock_hash must skip the lock-file check"
+        );
+    }
+
     /// M-20: git state (sha, branch, dirty flag) is stored in the cache as
     /// metadata but validate() never reads it — git changes do not invalidate.
     #[test]
@@ -1553,10 +1628,13 @@ mod tests {
     }
 
     /// M-21: env var first observed after initial parse (not in env_vars map).
-    /// If a new env() call is introduced in a macro that was NOT executed on the
-    /// previous parse run, the new var is absent from env_vars and is invisible
-    /// to validate(). This is a known limitation: validate() can only check vars
-    /// it was told about. Document this by asserting the behavior explicitly.
+    /// Env vars are tracked at runtime; macro definitions are stored as source
+    /// and never rendered at parse time. If a new env_var() call is introduced
+    /// in a macro that was NOT executed on the previous parse run, the new var
+    /// is absent from env_vars and invisible to validate(). Regex scanning over
+    /// macro_sql would not help: Jinja allows dynamic var names that are
+    /// undetectable statically. This is a known accepted limitation; dbt-core
+    /// Python has the same behavior.
     #[test]
     #[allow(clippy::disallowed_methods)]
     fn validate_does_not_detect_newly_introduced_env_var() {
@@ -1831,32 +1909,11 @@ mod tests {
         );
 
         save(&SaveArgs {
-            out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
             nodes: &nodes,
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(out_dir)
         })
         .unwrap();
     }
@@ -2116,32 +2173,11 @@ mod tests {
         );
 
         save(&SaveArgs {
-            out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
             nodes: &nodes,
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(out_dir)
         })
         .unwrap();
     }
@@ -2307,32 +2343,11 @@ mod tests {
             .into(),
         );
         save(&SaveArgs {
-            out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
             nodes: &nodes,
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(out_dir)
         })
         .unwrap();
     }
@@ -2358,32 +2373,11 @@ mod tests {
             }),
         );
         save(&SaveArgs {
-            out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
             nodes: &nodes,
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(out_dir)
         })
         .unwrap();
     }
@@ -2599,32 +2593,11 @@ mod tests {
         nodes.seeds.insert("seed.proj.my_seed".into(), seed.into());
 
         save(&SaveArgs {
-            out_dir: &out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
             nodes: &nodes,
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(&out_dir)
         })
         .unwrap();
 
@@ -2702,11 +2675,13 @@ mod tests {
         PackageSnapshot {
             package_root_path: root.to_str().unwrap().into(),
             package_name: "proj".into(),
+            manifest_path_config: ManifestPathConfig::default(),
             all_paths: HashMap::from([(
                 kind,
                 vec![(rel_path.into(), system_time_to_nanos(saved_mtime))],
             )]),
             dependencies: BTreeSet::new(),
+            is_local_dep: false,
         }
     }
 
@@ -3122,6 +3097,129 @@ mod tests {
         assert_eq!(r, Some("file deleted"), "docs .md delete → FullParse");
     }
 
+    // ── (G-4/G-5) pinned vs local-path dep file scanning ────────────────────
+
+    /// G-4: A pinned dep package (hub/git/tarball/private — `is_local_dep: false`)
+    /// is never file-scanned by `needs_full_parse()`.  Even if a macro file inside
+    /// the dep has a changed mtime, `needs_full_parse()` returns `None` because
+    /// the lock-file hash check in `validate()` already guarantees pinned-dep
+    /// content is unchanged.
+    #[test]
+    fn needs_full_parse_skips_pinned_dep_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Root package: one model file, mtime stable.
+        let root_model = tmp.path().join("models").join("my_model.sql");
+        let root_mtime = write_file(&root_model, b"select 1");
+        let root_pkg = PackageSnapshot {
+            package_root_path: tmp.path().to_str().unwrap().into(),
+            package_name: "my_project".into(),
+            manifest_path_config: ManifestPathConfig::default(),
+            all_paths: HashMap::from([(
+                ResourcePathKind::ModelPaths,
+                vec![(
+                    "models/my_model.sql".into(),
+                    system_time_to_nanos(root_mtime),
+                )],
+            )]),
+            dependencies: BTreeSet::new(),
+            is_local_dep: false,
+        };
+
+        // Dep package (pinned hub dep, installed under dbt_packages/dbt_utils).
+        let dep_dir = tmp.path().join("dbt_packages").join("dbt_utils");
+        let dep_macro = dep_dir.join("macros").join("surrogate_key.sql");
+        let dep_mtime = write_file(
+            &dep_macro,
+            b"{% macro generate_surrogate_key() %}{% endmacro %}",
+        );
+        let dep_pkg = PackageSnapshot {
+            package_root_path: dep_dir.to_str().unwrap().into(),
+            package_name: "dbt_utils".into(),
+            manifest_path_config: ManifestPathConfig::default(),
+            all_paths: HashMap::from([(
+                ResourcePathKind::MacroPaths,
+                vec![(
+                    "macros/surrogate_key.sql".into(),
+                    system_time_to_nanos(dep_mtime),
+                )],
+            )]),
+            dependencies: BTreeSet::new(),
+            is_local_dep: false, // pinned — must be skipped
+        };
+
+        let mut state = test_state();
+        state.packages = vec![root_pkg, dep_pkg];
+        state.env_vars.clear();
+
+        // Mutate the dep macro file — the pinned dep must still be skipped.
+        sleep_for_mtime_change();
+        std::fs::write(
+            &dep_macro,
+            b"{% macro generate_surrogate_key() %}v2{% endmacro %}",
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.needs_full_parse(),
+            None,
+            "pinned dep file change must not trigger FullParse — lock-file hash covers it"
+        );
+    }
+
+    /// G-5: A local-path dep (`is_local_dep: true`) IS file-scanned because the
+    /// lock file does not pin its content.  A changed macro file must trigger FullParse.
+    #[test]
+    fn needs_full_parse_scans_local_path_dep_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Root package.
+        let root_model = tmp.path().join("models").join("my_model.sql");
+        let root_mtime = write_file(&root_model, b"select 1");
+        let root_pkg = PackageSnapshot {
+            package_root_path: tmp.path().to_str().unwrap().into(),
+            package_name: "my_project".into(),
+            manifest_path_config: ManifestPathConfig::default(),
+            all_paths: HashMap::from([(
+                ResourcePathKind::ModelPaths,
+                vec![(
+                    "models/my_model.sql".into(),
+                    system_time_to_nanos(root_mtime),
+                )],
+            )]),
+            dependencies: BTreeSet::new(),
+            is_local_dep: false,
+        };
+
+        // Local-path dep (lives outside dbt_packages/ — e.g. `local: ../my_utils`).
+        let local_dep_dir = tmp.path().join("my_utils");
+        let local_macro = local_dep_dir.join("macros").join("util.sql");
+        let local_mtime = write_file(&local_macro, b"{% macro util() %}v1{% endmacro %}");
+        let local_pkg = PackageSnapshot {
+            package_root_path: local_dep_dir.to_str().unwrap().into(),
+            package_name: "my_utils".into(),
+            manifest_path_config: ManifestPathConfig::default(),
+            all_paths: HashMap::from([(
+                ResourcePathKind::MacroPaths,
+                vec![("macros/util.sql".into(), system_time_to_nanos(local_mtime))],
+            )]),
+            dependencies: BTreeSet::new(),
+            is_local_dep: true, // local-path dep — must be scanned
+        };
+
+        let mut state = test_state();
+        state.packages = vec![root_pkg, local_pkg];
+        state.env_vars.clear();
+
+        // Mutate the local dep macro — must be detected.
+        sleep_for_mtime_change();
+        std::fs::write(&local_macro, b"{% macro util() %}v2{% endmacro %}").unwrap();
+
+        assert_eq!(
+            state.needs_full_parse(),
+            Some("non-incremental file changed"),
+            "local-path dep macro change must trigger FullParse"
+        );
+    }
+
     // ── (A) content hash: profiles.yml, dbt_project.yml ──────────────────────
 
     #[test]
@@ -3326,6 +3424,28 @@ mod tests {
             "new env var not observed at parse time → not checked"
         );
         unsafe { std::env::remove_var("__DBT_MATRIX_NEW_VAR__") };
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn env_var_with_default_unset_is_not_removal() {
+        // env_var('FOO', 'default') with FOO unset records DEFAULT_ENV_PLACEHOLDER.
+        // A subsequent run where FOO is still unset must NOT invalidate the cache.
+        let mut state = test_state();
+        state.env_vars = HashMap::from([(
+            "__DBT_MATRIX_UNSET__".into(),
+            DEFAULT_ENV_PLACEHOLDER.into(),
+        )]);
+        unsafe { std::env::remove_var("__DBT_MATRIX_UNSET__") };
+        assert!(
+            state.validate(&None).is_none(),
+            "unset env var with default-placeholder snapshot → still unchanged"
+        );
+
+        // But if the var becomes set, treat it as a change.
+        unsafe { std::env::set_var("__DBT_MATRIX_UNSET__", "now-set") };
+        assert_eq!(state.validate(&None), Some("env var changed"));
+        unsafe { std::env::remove_var("__DBT_MATRIX_UNSET__") };
     }
 
     #[test]
@@ -3566,32 +3686,12 @@ mod tests {
             .insert("model.p.b".into(), make_model("model.p.b"));
 
         save(&SaveArgs {
-            out_dir: tmp.path(),
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
             nodes: &nodes,
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None, // cold write
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            // cold write
+            ..SaveArgs::test_default(tmp.path())
         })
         .unwrap();
 
@@ -3604,32 +3704,12 @@ mod tests {
         };
         let changed: HashSet<String> = ["model.p.a".into(), "model.p.b".into()].into();
         save(&SaveArgs {
-            out_dir: tmp.path(),
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
             nodes: &only_a_nodes,
-            disabled_nodes: &Nodes::default(),
             changed_nodes: Some(&changed),
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(tmp.path())
         })
         .unwrap();
 
@@ -3772,6 +3852,7 @@ mod tests {
             patterned_dangling_sources: Default::default(),
             run_started_at: dbt_state.run_started_at,
             runtime_config: Arc::new(DbtRuntimeConfig::default()),
+            manifest_path_configs: ManifestPathConfig::for_packages(&dbt_state.packages),
             manifest_selectors: Default::default(),
             resolved_selectors: Default::default(),
             root_project_quoting: Default::default(),
@@ -3850,41 +3931,24 @@ mod tests {
         let pkg = PackageSnapshot {
             package_root_path: tmp.path().to_str().unwrap().into(),
             package_name: "proj".into(),
+            manifest_path_config: ManifestPathConfig::default(),
             all_paths: HashMap::from([(
                 ResourcePathKind::ModelPaths,
                 vec![("models/orders.sql".into(), mtime)],
             )]),
             dependencies: BTreeSet::new(),
+            is_local_dep: false,
         };
 
         let out_dir = tmp.path().to_path_buf();
         save(&SaveArgs {
-            out_dir: &out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
             profile_hash: &profile.blake3_hash(),
-            profile_file_hash: "",
-            project_file_hash: "",
             cli_vars_hash: &hash_cli_vars(&None),
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
             packages: &[pkg],
-            nodes: &Nodes::default(),
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(&out_dir)
         })
         .unwrap();
 
@@ -3925,41 +3989,24 @@ mod tests {
         let pkg = PackageSnapshot {
             package_root_path: tmp.path().to_str().unwrap().into(),
             package_name: "proj".into(),
+            manifest_path_config: ManifestPathConfig::default(),
             all_paths: HashMap::from([(
                 ResourcePathKind::ModelPaths,
                 vec![("models/orders.sql".into(), mtime)],
             )]),
             dependencies: BTreeSet::new(),
+            is_local_dep: false,
         };
 
         let out_dir = tmp.path().to_path_buf();
         save(&SaveArgs {
-            out_dir: &out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
             profile_hash: &profile.blake3_hash(),
-            profile_file_hash: "",
-            project_file_hash: "",
             cli_vars_hash: &hash_cli_vars(&None),
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
             packages: &[pkg],
-            nodes: &Nodes::default(),
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(&out_dir)
         })
         .unwrap();
 
@@ -4003,41 +4050,24 @@ mod tests {
         let pkg = PackageSnapshot {
             package_root_path: tmp.path().to_str().unwrap().into(),
             package_name: "proj".into(),
+            manifest_path_config: ManifestPathConfig::default(),
             all_paths: HashMap::from([(
                 ResourcePathKind::MacroPaths,
                 vec![("macros/my_macro.sql".into(), mtime)],
             )]),
             dependencies: BTreeSet::new(),
+            is_local_dep: false,
         };
 
         let out_dir = tmp.path().to_path_buf();
         save(&SaveArgs {
-            out_dir: &out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
             profile_hash: &profile.blake3_hash(),
-            profile_file_hash: "",
-            project_file_hash: "",
             cli_vars_hash: &hash_cli_vars(&None),
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
             packages: &[pkg],
-            nodes: &Nodes::default(),
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(&out_dir)
         })
         .unwrap();
 
@@ -4121,32 +4151,11 @@ mod tests {
         );
 
         save(&SaveArgs {
-            out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
             nodes: &nodes,
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(out_dir)
         })
         .unwrap();
     }
@@ -4300,32 +4309,11 @@ mod tests {
         );
 
         save(&SaveArgs {
-            out_dir,
             version: INCREMENTAL_STATE_VERSION,
             dbt_version: &current_dbt_version(),
-            profile_hash: "",
-            profile_file_hash: "",
-            project_file_hash: "",
-            cli_vars_hash: "",
             dbt_profile_json: &dbt_profile_json,
-            vars_json: "{}",
-            env_vars_json: "{}",
-            get_relation_calls_json: "{}",
-            get_columns_in_relation_calls_json: "{}",
-            patterned_dangling_sources_json: "{}",
-            nodes_with_resolution_errors_json: "[]",
-            nodes_with_access_errors_json: "[]",
-            operations_json: "{\"on_run_start\":[],\"on_run_end\":[]}",
-            packages: &[],
             nodes: &nodes,
-            disabled_nodes: &Nodes::default(),
-            changed_nodes: None,
-            ingested_at: 0,
-            macros: &Macros::default(),
-            selectors_json: "",
-            git_sha: "",
-            git_branch: "",
-            git_is_dirty: false,
+            ..SaveArgs::test_default(out_dir)
         })
         .unwrap();
     }

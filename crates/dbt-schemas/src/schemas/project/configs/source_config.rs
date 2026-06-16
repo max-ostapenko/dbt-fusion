@@ -21,7 +21,7 @@ use crate::schemas::project::configs::common::WarehouseSpecificNodeConfig;
 use crate::schemas::project::configs::common::{default_meta_and_tags, default_quoting};
 use crate::schemas::project::{ResolvableConfig, TypedRecursiveConfig};
 use crate::schemas::serde::{
-    IndexesConfig, PrimaryKeyConfig, StringOrArrayOfStrings, bool_or_string_bool,
+    IndexesConfig, PartitionsConfig, PrimaryKeyConfig, StringOrArrayOfStrings, bool_or_string_bool,
     f64_or_string_f64, u64_or_string_u64,
 };
 
@@ -89,7 +89,7 @@ pub struct ProjectSourceConfig {
     #[serde(rename = "+grant_access_to")]
     pub grant_access_to: Option<Vec<GrantAccessToTarget>>,
     #[serde(rename = "+partitions")]
-    pub partitions: Option<Vec<String>>,
+    pub partitions: Option<PartitionsConfig>,
     #[serde(
         default,
         rename = "+enable_refresh",
@@ -297,6 +297,7 @@ impl From<ProjectSourceConfig> for SourceConfig {
                 snowflake_initialization_warehouse: None,
                 immutable_where: None,
                 snowflake_warehouse: None,
+                refresh_warehouse: None,
                 refresh_mode: None,
                 initialize: None,
                 scheduler: None,

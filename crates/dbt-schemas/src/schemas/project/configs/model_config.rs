@@ -1,5 +1,6 @@
 use crate::schemas::common::ClusterConfig;
 use crate::schemas::serde::OmissibleGrantConfig;
+use crate::schemas::serde::PartitionsConfig;
 use crate::schemas::serde::QueryTag;
 use dbt_common::io_args::ComputeArg;
 use dbt_common::io_args::StaticAnalysisKind;
@@ -51,11 +52,9 @@ use crate::schemas::serde::{
 };
 use dbt_proc_macros::Resolvable;
 use dbt_yaml::ShouldBe;
-use serde_with::skip_serializing_none;
 
 /// Represents the latest version view configuration for versioned models.
 /// Supports shorthand (bool) and full form ({enabled: bool, alias: string}).
-#[skip_serializing_none]
 #[derive(Deserialize, Serialize, Debug, Default, Clone, PartialEq, DbtSchema)]
 pub struct LatestVersionPointer {
     pub enabled: Option<bool>,
@@ -369,7 +368,7 @@ pub struct ProjectModelConfig {
     )]
     pub partition_expiration_days: Option<u64>,
     #[serde(rename = "+partitions")]
-    pub partitions: Option<Vec<String>>,
+    pub partitions: Option<PartitionsConfig>,
     #[serde(rename = "+persist_docs")]
     pub persist_docs: Option<PersistDocsConfig>,
     #[serde(rename = "+post-hook")]
@@ -428,6 +427,8 @@ pub struct ProjectModelConfig {
     pub snowflake_initialization_warehouse: Option<String>,
     #[serde(rename = "+snowflake_warehouse")]
     pub snowflake_warehouse: Option<String>,
+    #[serde(rename = "+refresh_warehouse")]
+    pub refresh_warehouse: Option<String>,
     #[serde(rename = "+immutable_where")]
     pub immutable_where: Option<String>,
     #[serde(rename = "+sql_header")]
@@ -541,6 +542,7 @@ pub struct ModelConfig {
     pub incremental_strategy: Option<DbtIncrementalStrategy>,
     pub incremental_predicates: Option<Vec<String>>,
     pub batch_size: Option<DbtBatchSize>,
+    #[resolved(promote, default = 1)]
     pub lookback: Option<i32>,
     pub begin: Option<String>,
     pub persist_docs: Option<PersistDocsConfig>,
@@ -577,6 +579,7 @@ pub struct ModelConfig {
     pub static_analysis: Option<Spanned<StaticAnalysisKind>>,
     pub freshness: Option<ModelFreshness>,
     pub state: Option<ModelState>,
+    #[resolved(promote)]
     pub latest_version_pointer: Option<LatestVersionPointer>,
     pub sql_header: Option<String>,
     pub location: Option<String>,
@@ -690,6 +693,7 @@ impl From<ProjectModelConfig> for ModelConfig {
                 target_lag: config.target_lag,
                 snowflake_initialization_warehouse: config.snowflake_initialization_warehouse,
                 snowflake_warehouse: config.snowflake_warehouse,
+                refresh_warehouse: config.refresh_warehouse,
                 immutable_where: config.immutable_where,
                 refresh_mode: config.refresh_mode,
                 initialize: config.initialize,
@@ -856,6 +860,7 @@ impl From<ModelConfig> for ProjectModelConfig {
                 .__warehouse_specific_config__
                 .snowflake_initialization_warehouse,
             snowflake_warehouse: config.__warehouse_specific_config__.snowflake_warehouse,
+            refresh_warehouse: config.__warehouse_specific_config__.refresh_warehouse,
             immutable_where: config.__warehouse_specific_config__.immutable_where,
             refresh_mode: config.__warehouse_specific_config__.refresh_mode,
             initialize: config.__warehouse_specific_config__.initialize,
@@ -1227,7 +1232,16 @@ impl ModelConfig {
         let table_format_eq = self.table_format == other.table_format;
         let freshness_eq = self.freshness == other.freshness;
         let state_eq = self.state == other.state;
-        let latest_version_pointer_eq = self.latest_version_pointer == other.latest_version_pointer;
+        // Treat `None` and `Some(LatestVersionPointer::default())` as equivalent so that
+        // previous-state manifests written before `latest_version_pointer` was emitted as
+        // a default struct (i.e. `null`) do not register as modified after the emit change.
+        let default_lvp = LatestVersionPointer::default();
+        let latest_version_pointer_eq =
+            self.latest_version_pointer.as_ref().unwrap_or(&default_lvp)
+                == other
+                    .latest_version_pointer
+                    .as_ref()
+                    .unwrap_or(&default_lvp);
         let sql_header_eq = self.sql_header == other.sql_header;
         let location_eq = self.location == other.location;
         let predicates_eq = self.predicates == other.predicates;
@@ -1574,9 +1588,7 @@ impl ConfigKeys for ModelConfig {
 // Helper function to compare on_schema_change fields, treating None and default OnSchemaChange as equivalent
 fn on_schema_change_eq(a: &Option<OnSchemaChange>, b: &Option<OnSchemaChange>) -> bool {
     use crate::schemas::common::OnSchemaChange;
-    // Default value in dbt-core is "ignore"
-    // See https://github.com/dbt-labs/dbt-core/blob/main/core/dbt/artifacts/resources/v1/config.py#L109
-    let default_on_schema_change = OnSchemaChange::Ignore;
+    let default_on_schema_change = OnSchemaChange::default();
 
     match (a, b) {
         // Both None
@@ -1716,7 +1728,7 @@ state:
   require_fresh_data_from: all
   evaluate_volatile_sql: true
   pre_clone: if_missing
-  execute_hooks_on_reuse: true
+  execute_hooks_on_any_reuse: true
 __warehouse_specific_config__: {}
 "#,
         )
@@ -1729,7 +1741,7 @@ __warehouse_specific_config__: {}
         assert_eq!(state.require_fresh_data_from, Some(UpdatesOn::All));
         assert_eq!(state.evaluate_volatile_sql, Some(true));
         assert_eq!(state.pre_clone, Some(StatePreClone::IfMissing));
-        assert_eq!(state.execute_hooks_on_reuse, Some(true));
+        assert_eq!(state.execute_hooks_on_any_reuse, Some(true));
     }
 
     #[test]
@@ -1743,7 +1755,7 @@ __warehouse_specific_config__: {}
   require_fresh_data_from: any
   evaluate_volatile_sql: false
   pre_clone: always
-  execute_hooks_on_reuse: false
+  execute_hooks_on_any_reuse: false
 __additional_properties__: {}
 "#,
         )
@@ -1756,7 +1768,66 @@ __additional_properties__: {}
         assert_eq!(state.require_fresh_data_from, Some(UpdatesOn::Any));
         assert_eq!(state.evaluate_volatile_sql, Some(false));
         assert_eq!(state.pre_clone, Some(StatePreClone::Always));
-        assert_eq!(state.execute_hooks_on_reuse, Some(false));
+        assert_eq!(state.execute_hooks_on_any_reuse, Some(false));
+    }
+
+    #[test]
+    fn test_project_model_config_state_lag_tolerance_parses_duration_string() {
+        let config: ProjectModelConfig = dbt_yaml::from_str(
+            r#"
++state:
+  lag_tolerance: "1 day"
+__additional_properties__: {}
+"#,
+        )
+        .unwrap();
+
+        let state = config.state.expect("+state config should parse");
+        let lag_tolerance = state.lag_tolerance.expect("lag_tolerance should parse");
+        assert_eq!(lag_tolerance.count, Some(1));
+        assert_eq!(lag_tolerance.period, Some(FreshnessPeriod::day));
+
+        let config: ProjectModelConfig = dbt_yaml::from_str(
+            r#"
++state:
+  lag_tolerance: "1d"
+__additional_properties__: {}
+"#,
+        )
+        .unwrap();
+
+        let state = config.state.expect("+state config should parse");
+        let lag_tolerance = state.lag_tolerance.expect("lag_tolerance should parse");
+        assert_eq!(lag_tolerance.count, Some(1));
+        assert_eq!(lag_tolerance.period, Some(FreshnessPeriod::day));
+
+        let config: ProjectModelConfig = dbt_yaml::from_str(
+            r#"
++state:
+  lag_tolerance: "1.5h"
+__additional_properties__: {}
+"#,
+        )
+        .unwrap();
+
+        let state = config.state.expect("+state config should parse");
+        let lag_tolerance = state.lag_tolerance.expect("lag_tolerance should parse");
+        assert_eq!(lag_tolerance.count, Some(90));
+        assert_eq!(lag_tolerance.period, Some(FreshnessPeriod::minute));
+
+        let config: ProjectModelConfig = dbt_yaml::from_str(
+            r#"
++state:
+  lag_tolerance: "0s"
+__additional_properties__: {}
+"#,
+        )
+        .unwrap();
+
+        let state = config.state.expect("+state config should parse");
+        let lag_tolerance = state.lag_tolerance.expect("lag_tolerance should parse");
+        assert_eq!(lag_tolerance.count, Some(0));
+        assert_eq!(lag_tolerance.period, Some(FreshnessPeriod::minute));
     }
 
     #[test]

@@ -47,6 +47,7 @@ use dbt_schemas::schemas::common::DbtQuoting;
 use dbt_schemas::schemas::common::DocsConfig;
 use dbt_schemas::schemas::common::NodeDependsOn;
 use dbt_schemas::schemas::common::ResolvedQuoting;
+use dbt_schemas::schemas::common::merge_tags;
 use dbt_schemas::schemas::nodes::DbtModel;
 use dbt_schemas::schemas::nodes::TestMetadata;
 use dbt_schemas::schemas::project::DataTestConfig;
@@ -192,20 +193,50 @@ fn test_metadata_from_asset(asset: &GenericTestAsset) -> Option<TestMetadata> {
     None
 }
 
+fn file_key_name_from_asset(asset: &GenericTestAsset) -> Option<String> {
+    // Match dbt-core's `{yaml_key}.{name}` for generic tests. Source tests use
+    // the source collection name rather than the table name.
+    let yaml_key = match asset.resource_type.as_str() {
+        "model" => "models",
+        "seed" => "seeds",
+        "snapshot" => "snapshots",
+        "source" => "sources",
+        "analysis" => "analyses",
+        other => other,
+    };
+    let name = asset
+        .source_name
+        .as_deref()
+        .unwrap_or(asset.resource_name.as_str());
+    Some(format!("{yaml_key}.{name}"))
+}
+
 pub fn build_data_test_raw_code(
     test_metadata: Option<TestMetadata>,
-    alias: String,
+    alias: Option<String>,
 ) -> Option<String> {
     if let Some(test_metadata) = test_metadata {
-        let config_str = format!("config(alias=\"{alias}\")");
-
         let mut test_macro_name = format!("test_{}", test_metadata.name);
         if let Some(namespace) = test_metadata.namespace {
             test_macro_name = format!("{}.{}", namespace, test_macro_name);
         }
 
+        // Match dbt-core's generic_test_builders.py:construct_config — only emit a
+        // `{{ config(...) }}` postfix when there's at least one explicit config key
+        // (e.g. alias when the name was truncated, or a user-supplied alias).
+        // TODO: also emit other user-supplied CONFIG_ARGS (severity, where, limit,
+        // tags, enabled, warn_if, error_if, fail_calc, store_failures,
+        // store_failures_as, sql_header, meta, database, schema). Requires threading
+        // the parent resource's MinimalPropertiesEntry.schema_value (columns -> tests
+        // -> config) into resolve_data_tests so we can distinguish YAML-supplied keys
+        // from project-level defaults. See TODO at the unrendered_config build site.
+        let config_str = match alias {
+            Some(alias) => format!("{{{{ config(alias=\"{alias}\") }}}}"),
+            None => String::new(),
+        };
+
         return Some(format!(
-            "{{{{ {test_macro_name}(**_dbt_generic_test_kwargs) }}}}{{{{ {config_str} }}}}"
+            "{{{{ {test_macro_name}(**_dbt_generic_test_kwargs) }}}}{config_str}"
         ));
     }
 
@@ -370,6 +401,14 @@ pub async fn resolve_data_tests(
             &DataTestProperties::empty(test_name.to_owned())
         };
 
+        // Merge column test tags into the top-level config.
+        // Reference: https://github.com/dbt-labs/dbt-core/blob/b783c97eff9cf72e6fc43ef93523b8ec7b029583/core/dbt/parser/schema_generic_tests.py#L368
+        let test_tags = test_config.tags.clone().map(|tags| tags.into());
+        let column_tags = test_path_to_test_asset
+            .get(&dbt_asset.path)
+            .map(|asset| asset.column_tags.clone());
+        let tags = merge_tags(test_tags, column_tags);
+
         // To conform to the unique_id format in dbt-core, we need to hash the test name
         // plus the test metadata (namespace, name, kwargs) and append the last 10 characters
         // of the hash to the unique_id.
@@ -485,7 +524,9 @@ pub async fn resolve_data_tests(
                 name_span: dbt_common::Span::default(),
                 // original_file_path is a misnomer for tests, it's the path to the generated sql file
                 original_file_path: generated_file_path,
-                patch_path: Some(patch_path.to_path_buf()),
+                // The patch-path is always set to None in Core:
+                // https://github.com/dbt-labs/dbt-mantle/blob/da5abca4f829b167bd1b1d5c6666c12cd8c719c0/core/dbt/parser/schema_generic_tests.py#L119
+                patch_path: None,
                 unique_id: unique_id.clone(),
                 fqn,
                 // dbt-core: description is always default ''
@@ -500,11 +541,7 @@ pub async fn resolve_data_tests(
                 // - Singular test: "SELECT 1\nFROM {{ ref('customers') }}\nLIMIT 0"
                 raw_code: Some("will_be_updated_below".to_string()),
                 language: Some("sql".to_string()),
-                tags: test_config
-                    .tags
-                    .clone()
-                    .map(|tags| tags.into())
-                    .unwrap_or_default(),
+                tags: tags.unwrap_or_default(),
                 meta: test_config.meta.clone().unwrap_or_default(),
             },
             __base_attr__: NodeBaseAttributes {
@@ -580,23 +617,6 @@ pub async fn resolve_data_tests(
                         ))
                     }
                 });
-                // Match dbt-core schema_generic_tests.py:218-221: `{yaml_key}.{name}`.
-                // For source tests, name is the source-collection name, not the table.
-                let file_key_name = test_asset.map(|ta| {
-                    let yaml_key = match ta.resource_type.as_str() {
-                        "model" => "models",
-                        "seed" => "seeds",
-                        "snapshot" => "snapshots",
-                        "source" => "sources",
-                        "analysis" => "analyses",
-                        other => other,
-                    };
-                    let name = ta
-                        .source_name
-                        .as_deref()
-                        .unwrap_or(ta.resource_name.as_str());
-                    format!("{yaml_key}.{name}")
-                });
                 let group = attached_node
                     .as_deref()
                     .and_then(|id| models.get(id))
@@ -605,7 +625,7 @@ pub async fn resolve_data_tests(
                     column_name: test_asset.and_then(|ta| ta.test_metadata_column_name.clone()),
                     attached_node,
                     test_metadata: inferred_test_metadata.clone(),
-                    file_key_name,
+                    file_key_name: test_asset.and_then(|ta| file_key_name_from_asset(ta)),
                     introspection: IntrospectionKind::None,
                     original_name: test_asset.and_then(|ta| ta.original_name.clone()),
                     group,
@@ -635,7 +655,7 @@ pub async fn resolve_data_tests(
                     None
                 }
             }),
-            store_failures: test_config.store_failures,
+            store_failures: Some(test_config.store_failures.unwrap_or(false) || arg.store_failures),
         };
 
         // Update with relation components
@@ -652,7 +672,7 @@ pub async fn resolve_data_tests(
         dbt_test.__common_attr__.raw_code = if is_singular_data_test {
             get_original_file_contents(&arg.io.in_dir, &manifest_original_file_path)
         } else {
-            build_data_test_raw_code(inferred_test_metadata, dbt_test.__base_attr__.alias.clone())
+            build_data_test_raw_code(inferred_test_metadata, components.alias.clone())
         };
 
         match status {
@@ -723,6 +743,7 @@ mod tests {
             original_name: None,
             unique_id_hash: None,
             version: None,
+            column_tags: vec![],
         };
         let md = test_metadata_from_asset(&asset).expect("metadata");
         assert_eq!(md.name, "not_null");
@@ -774,6 +795,7 @@ mod tests {
             original_name: Some(full_name.to_string()),
             unique_id_hash: None,
             version: None,
+            column_tags: vec![],
         };
 
         let unique_id = compute_generic_test_unique_id("my_project", &asset);
@@ -813,6 +835,7 @@ mod tests {
             original_name: None,
             unique_id_hash: None,
             version: None,
+            column_tags: vec![],
         };
         let md = test_metadata_from_asset(&asset).expect("metadata");
         assert_eq!(md.name, "unique_combination_of_columns");

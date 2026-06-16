@@ -56,7 +56,7 @@ use dbt_schemas::state::{DbtAsset, DbtPackage, DbtState, ResourcePathKind};
 
 use crate::args::{IoArgs, LoadArgs};
 use crate::dbt_project_yml_loader::load_project_yml;
-use crate::download_publication::download_publication_artifacts;
+use crate::loader_hooks::LoaderHooks;
 use crate::utils::{collect_file_info, identify_package_dependencies};
 use crate::{
     construct_internal_packages, load_internal_packages, load_packages, load_profiles, load_vars,
@@ -182,14 +182,39 @@ pub async fn load(
     iarg: Cow<'_, InvocationArgs>,
     tracing_features: Option<&dyn TracingConfigProvider>,
     token: &CancellationToken,
+    loader_hooks: Arc<dyn LoaderHooks>,
 ) -> FsResult<DbtState> {
     let (simplified_dbt_project, mut dbt_profile, vars_from_file) =
         load_simplified_project_and_profiles(arg).await?;
 
     // Parse dbt_cloud.yml (if it exists)
-    let dbt_cloud_yml = dbt_cloud_config::get_cloud_project_path()
-        .ok()
-        .and_then(|p| dbt_cloud_config::parse_cloud_config(&p).ok().flatten());
+    let dbt_cloud_yml = match dbt_cloud_config::get_cloud_project_path() {
+        Ok(path) => match dbt_cloud_config::parse_cloud_config(&path) {
+            Ok(config) => config,
+            Err(e) => {
+                emit_warn_log_message(
+                    ErrorCode::InvalidConfig,
+                    format!(
+                        "Ignoring dbt_cloud.yml: {}. Cloud credentials will not be available.",
+                        e
+                    ),
+                    arg.io.status_reporter.as_ref(),
+                );
+                None
+            }
+        },
+        Err(e) => {
+            emit_warn_log_message(
+                ErrorCode::InvalidConfig,
+                format!(
+                    "Could not determine dbt_cloud.yml path: {}. Cloud credentials will not be available.",
+                    e
+                ),
+                arg.io.status_reporter.as_ref(),
+            );
+            None
+        }
+    };
 
     // Resolve cloud config with precedence: env > dbt_project.yml > dbt_cloud.yml
     let cloud_config = resolve_cloud_config(
@@ -421,7 +446,8 @@ pub async fn load(
         persist_internal_packages(
             &internal_packages_install_path,
             adapter_type,
-            arg.enable_persist_compare_package,
+            &arg,
+            loader_hooks.clone(),
         )?;
     }
 
@@ -450,8 +476,8 @@ pub async fn load(
     );
 
     if !is_time_machine_replay {
-        // get publication artifact for each upstream project
-        download_publication_artifacts(&upstream_projects, &dbt_state.cloud_config, &arg.io)
+        loader_hooks
+            .download_artifacts(&upstream_projects, &dbt_state.cloud_config, &arg.io)
             .await?;
     }
 
@@ -491,6 +517,9 @@ pub async fn load(
             InternalPackageMode::Embedded => {
                 #[allow(unused_mut)]
                 let mut pkgs = construct_internal_packages(adapter_type, &arg.io.in_dir)?;
+                loader_hooks
+                    .will_load_internal_packages(&arg, &mut pkgs)
+                    .await?;
                 // Register vars for each internal package
                 for pkg in &pkgs {
                     load_vars(&pkg.dbt_project.name, None, &mut collected_vars)?;

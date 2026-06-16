@@ -16,6 +16,10 @@ use dbt_jinja_utils::jinja_environment::JinjaEnv;
 use dbt_jinja_utils::phases::compile::{
     DependencyValidationConfig, build_compile_node_context_inner,
 };
+use dbt_run_cache::metadata_cache::RunCacheMetadataCache;
+use dbt_run_cache::service_client::SharedRunCacheServiceClient;
+use dbt_run_cache::service_config::RunCacheServiceConfig;
+use dbt_run_cache::view_traversal::ViewDefinitionTraverser;
 use dbt_schema_store::{DataStoreTrait, SchemaStoreTrait};
 use dbt_schemas::materialization_resolver::MaterializationResolver;
 use dbt_schemas::schemas::common::UpdatesOn;
@@ -31,6 +35,18 @@ use crate::test_aggregation::GenericTestRelationships;
 use crate::visitor::SkipReason;
 
 use dbt_schemas::schemas::common::DbtMaterialization;
+
+/// Run-cache fields that live on [`TaskRunnerCtxInner`] and are passed in at
+/// construction time from the extended-context factory.
+pub struct RunCacheCtx {
+    pub run_cache_metadata: Arc<RunCacheMetadataCache>,
+    pub run_cache_dev_cloned_nodes: DashMap<String, ()>,
+    pub run_cache_deferred_fqns: BTreeSet<String>,
+    pub run_cache_service_requested: bool,
+    pub run_cache_service_config: Option<RunCacheServiceConfig>,
+    pub run_cache_service_client: Option<SharedRunCacheServiceClient>,
+    pub view_traverser: Option<Arc<ViewDefinitionTraverser>>,
+}
 
 /// Information about a rendered node, used for unit test hash computation.
 #[derive(Debug, Clone)]
@@ -55,6 +71,8 @@ pub struct TaskRunnerCtxInner {
     // TODO: Use SIPHash128 for fingerprinting the sets
     pub runnable_set: BTreeSet<String>,
     pub extended_ctx: Box<dyn ExtendedCtx>,
+    pub compiled_sql_cache: Arc<dyn crate::CompiledSqlCache>,
+    pub adhoc_runner: Arc<dyn crate::AdhocRunner>,
     pub materialization_resolver: Arc<MaterializationResolver>,
     pub root_project_name: String,
     pub adapter_type: AdapterType,
@@ -66,6 +84,9 @@ pub struct TaskRunnerCtxInner {
     pub preview_results: parking_lot::Mutex<Option<(Vec<RecordBatch>, SchemaRef)>>,
     /// Error from a failed show query; set by run_show when execution fails, collected after the task loop.
     pub preview_error: parking_lot::Mutex<Option<String>>,
+    // <Start> RunCache-related fields. These are only populated when the RunCache is enabled for the current execution.
+    pub run_cache_ctx: RunCacheCtx,
+    // <End> RunCache-related fields.
 }
 
 impl TaskRunnerCtxInner {
@@ -77,10 +98,13 @@ impl TaskRunnerCtxInner {
         base_context: BTreeMap<String, Value>,
         node_hashes: DashMap<String, String>,
         extended_ctx: Box<dyn ExtendedCtx>,
+        compiled_sql_cache: Arc<dyn crate::CompiledSqlCache>,
+        adhoc_runner: Arc<dyn crate::AdhocRunner>,
         resolver_state: &Arc<ResolverState>,
         generic_test_relationships: GenericTestRelationships,
         span_manager: Arc<SpanManager<FsResult<NodeStatus>, SkipReason>>,
         execute: dbt_schemas::schemas::profiles::Execute,
+        run_cache_ctx: RunCacheCtx,
     ) -> Self {
         let runnable_set = schedule
             .selected_nodes
@@ -115,6 +139,8 @@ impl TaskRunnerCtxInner {
             execute,
             runnable_set,
             extended_ctx,
+            compiled_sql_cache,
+            adhoc_runner,
             materialization_resolver: Arc::new(materialization_resolver),
             root_project_name: resolver_state.root_project_name.clone(),
             adapter_type: resolver_state.adapter_type,
@@ -124,6 +150,7 @@ impl TaskRunnerCtxInner {
             span_manager,
             preview_results: parking_lot::Mutex::new(None),
             preview_error: parking_lot::Mutex::new(None),
+            run_cache_ctx,
         }
     }
 

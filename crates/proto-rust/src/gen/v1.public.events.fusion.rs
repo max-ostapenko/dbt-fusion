@@ -153,6 +153,9 @@ pub struct Invocation {
     /// at a project level.
     #[prost(string, tag = "10")]
     pub git_commit_sha: ::prost::alloc::string::String,
+    /// The distribution of dbt that was used to run this command.
+    #[prost(string, tag = "11")]
+    pub distribution: ::prost::alloc::string::String,
 }
 impl ::prost::Name for Invocation {
     const NAME: &'static str = "Invocation";
@@ -479,6 +482,7 @@ pub enum OnboardingScreen {
     DownloadAgentsMd = 17,
     CompileSaBaseline = 18,
     CompileSaBaselineSuccess = 19,
+    Login = 20,
 }
 impl OnboardingScreen {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -507,6 +511,7 @@ impl OnboardingScreen {
             Self::DownloadAgentsMd => "DOWNLOAD_AGENTS_MD",
             Self::CompileSaBaseline => "COMPILE_SA_BASELINE",
             Self::CompileSaBaselineSuccess => "COMPILE_SA_BASELINE_SUCCESS",
+            Self::Login => "LOGIN",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -532,6 +537,7 @@ impl OnboardingScreen {
             "DOWNLOAD_AGENTS_MD" => Some(Self::DownloadAgentsMd),
             "COMPILE_SA_BASELINE" => Some(Self::CompileSaBaseline),
             "COMPILE_SA_BASELINE_SUCCESS" => Some(Self::CompileSaBaselineSuccess),
+            "LOGIN" => Some(Self::Login),
             _ => None,
         }
     }

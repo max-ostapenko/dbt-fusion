@@ -734,26 +734,13 @@ pub fn try_or_compiler_error_fn()
     move |state: &State<'_, '_>, args: &[Value], kwargs: Kwargs| -> Result<Value, Error> {
         let mut args = ArgParser::new(args, Some(kwargs));
         let message_if_exception = args.get::<String>("message_if_exception")?;
-        let location_of_func = args.get::<Value>("loc")?;
-        let func_name = args.get::<String>("func")?;
-        // Get remaining args and kwargs
+        let func = args.get::<Value>("func")?;
         let mut remaining_args = args.get_args_as_vec_of_values();
         let drained_kwargs = args.drain_kwargs();
         let remaining_kwargs = Kwargs::from_iter(drained_kwargs);
         remaining_args.push(remaining_kwargs.into());
 
-        let result = if location_of_func.is_none() {
-            let func = state.lookup(&func_name, &[]).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidOperation,
-                    format!("Unknown function {func_name}"),
-                )
-            })?;
-            func.call(state, &remaining_args, &[])
-        } else {
-            location_of_func.call_method(state, &func_name, &remaining_args, &[])
-        };
-        match result {
+        match func.call(state, &remaining_args, &[]) {
             Ok(result) => Ok(result),
             // TODO: we need to raise CompilationError(message_if_exception, self.model)
             Err(_) => Err(Error::new(
@@ -1402,17 +1389,15 @@ pub fn build_flat_graph(nodes: &Nodes, defer_nodes: Option<&Nodes>) -> MutableMa
             (unique_id.clone(), Value::from_serialize(serialized))
         }))
         .chain(nodes.tests.iter().map(|(unique_id, test)| {
-            // For tests, update original_file_path to use patch_path if it exists
-            // we also do this this when we write the test to the manifest
-            // (indicates test was defined in a YAML file)
+            // For tests, override original_file_path with manifest_original_file_path to match
+            // what the manifest serializes: schema.yml path for generic tests, generated SQL
+            // path for singular tests.
             let mut serialized = (Arc::as_ref(test) as &dyn InternalDbtNode).serialize_keep_none();
             if let YmlValue::Mapping(ref mut map, _) = serialized {
-                if let Some(patch_path) = &test.__common_attr__.patch_path {
-                    map.insert(
-                        YmlValue::string("original_file_path".to_string()),
-                        YmlValue::string(patch_path.display().to_string()),
-                    );
-                }
+                map.insert(
+                    YmlValue::string("original_file_path".to_string()),
+                    YmlValue::string(test.manifest_original_file_path.display().to_string()),
+                );
                 // For tests, use just the file name (not the full path) for consistency with dbt-core manifest format
                 // Generic tests have paths like "tests/generic_tests/not_null_foo_id.sql" but manifest expects "not_null_foo_id.sql"
                 let path_key = YmlValue::string("path".to_string());

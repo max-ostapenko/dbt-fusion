@@ -1,5 +1,4 @@
 use console::Style;
-use dbt_common::cli_parser_trait::CliParserTrait;
 use dbt_common::collections::HashSet;
 use dbt_common::io_utils::determine_project_dir;
 use dbt_common::{ErrorCode, FsResult, fs_err, stdfs};
@@ -7,7 +6,9 @@ use dbt_yaml::Value as YValue;
 use serde::{Deserialize, Serialize};
 
 use std::any::Any;
-use std::ffi::{OsStr, OsString};
+use std::env;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::sync::LazyLock;
 use std::{
@@ -36,7 +37,8 @@ use dbt_common::io_args::{
 };
 use dbt_common::io_args::{DisplayFormat, ListOutputFormat, StaticAnalysisKind};
 use dbt_common::row_limit::RowLimit;
-use dbt_common::warn_error_options::{WarnErrorOptions, parse_warn_error_options};
+use dbt_common::warn_error_options::WarnErrorOptions;
+use dbt_common::warn_error_options::parse_warn_error_options;
 
 use dbt_common::node_selector::{
     IndirectSelection, MethodName, SelectionCriteria, parse_model_specifiers,
@@ -55,6 +57,8 @@ use self::commands::{CommandParser, ExtensionCommandParser};
 
 pub const DEFAULT_LIMIT: &str = "10";
 pub const DEFAULT_FORMAT: DisplayFormat = DisplayFormat::Table;
+const MANAGE_STATE_ENV: &str = "DBT_ENGINE_MANAGE_STATE";
+const USER_SETTINGS_YML: &str = ".dbt/user_settings.yml";
 
 // defined in pretty string, but copied here to avoid cycle...
 static BOLD: LazyLock<Style> = LazyLock::new(|| Style::new().bold());
@@ -62,12 +66,7 @@ static BOLD: LazyLock<Style> = LazyLock::new(|| Style::new().bold());
 // ----------------------------------------------------------------------------------------------
 // Cli and its subcommands
 
-static ABOUT: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "dbt-fusion {}: A fast and enriched dbt compiler and runner",
-        env!("CARGO_PKG_VERSION")
-    )
-});
+const ABOUT: &str = "With dbt, data analysts and engineers can build analytics the way engineers build applications.";
 static AFTER_HELP: LazyLock<String> = LazyLock::new(|| {
     format!(
         "{}",
@@ -84,19 +83,36 @@ const CLI_HELP_TEMPLATE: &str = "\
 
 {subcommands}{after-help}";
 
+pub trait CliParserFactory: Send + Sync {
+    fn create(&self, command_name: &'static str) -> CliParser;
+}
+
 /// An equivalent of [clap::Parser] that produces a [Cli] instead of parsing into itself.
 ///
 /// This allows us to programatically control the clap setup and parsing process as
 /// it allows [clap::Parser::try_parse] to be implemented as a method with a receiver
 /// that can carry dependencies instead of a static method.
 pub struct CliParser {
+    command_name: &'static str,
     command_parser: CommandParser,
 }
 
 impl CliParser {
-    pub fn new(extension_command_parser: Box<dyn ExtensionCommandParser>) -> Self {
+    pub fn new(
+        command_name: &'static str,
+        extension_command_parser: Box<dyn ExtensionCommandParser>,
+    ) -> Self {
         let command_parser = CommandParser::new(extension_command_parser);
-        Self { command_parser }
+        Self {
+            command_name,
+            command_parser,
+        }
+    }
+
+    /// User-facing CLI brand name. Surfaced in clap help/version output,
+    /// the version banner, and `--log-format json` log lines.
+    pub fn command_name(&self) -> &'static str {
+        self.command_name
     }
 
     /// Instantiate `Cli` from the `ArgMatches` that `clap` generated.
@@ -115,7 +131,7 @@ impl CliParser {
 
     /// Build the [clap::Command] for the CLI application.
     fn app(&self) -> clap::Command {
-        let app = clap::Command::new("dbt-fusion");
+        let app = clap::Command::new(self.command_name);
 
         // -- Augment arguments
         let app = app.group(clap::ArgGroup::new("Cli").multiple(true).args({
@@ -133,7 +149,7 @@ impl CliParser {
         app.author("dbt Labs <info@getdbt.com>")
             .version(env!("CARGO_PKG_VERSION"))
             .long_about(None)
-            .about(&**ABOUT)
+            .about(ABOUT)
             .after_help(&**AFTER_HELP)
             .help_template(CLI_HELP_TEMPLATE)
     }
@@ -147,29 +163,21 @@ impl CliParser {
     pub fn write_completions<W: std::io::Write>(&self, shell: Shell, writer: &mut W) {
         clap_complete::generate(shell, &mut self.app(), "dbt", writer);
     }
-}
-
-impl CliParserTrait for CliParser {
-    type CliType = Cli;
 
     /// Parse from `std::env::args_os()`, [exit][Error::exit] on error.
-    fn parse(&self) -> Box<Cli> {
+    pub fn parse(&self) -> Box<Cli> {
         let mut matches = self.app().get_matches();
         let res = self
             .try_parse_from_arg_matches_mut(&mut matches)
             .map_err(|err| self.format_error(err));
         match res {
             Ok(s) => Box::new(s),
-            Err(e) => {
-                // Since this is more of a development-time error, we aren't doing as fancy of a quit
-                // as `get_matches`
-                e.exit()
-            }
+            Err(e) => e.exit(),
         }
     }
 
     /// Parse from `std::env::args_os()`, return Err on error.
-    fn try_parse(&self) -> Result<Box<Cli>, clap::Error> {
+    pub fn try_parse(&self) -> Result<Box<Cli>, clap::Error> {
         let mut matches = self.app().try_get_matches()?;
         let cli = self
             .try_parse_from_arg_matches_mut(&mut matches)
@@ -178,7 +186,7 @@ impl CliParserTrait for CliParser {
     }
 
     /// Parse from iterator, [exit][clap::Error::exit] on error.
-    fn parse_from<I, T>(&self, itr: I) -> Box<Self::CliType>
+    pub fn parse_from<I, T>(&self, itr: I) -> Box<Cli>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
@@ -189,16 +197,12 @@ impl CliParserTrait for CliParser {
             .map_err(|err| self.format_error(err));
         match res {
             Ok(s) => Box::new(s),
-            Err(e) => {
-                // Since this is more of a development-time error, we aren't doing as fancy of a quit
-                // as `get_matches_from`
-                e.exit()
-            }
+            Err(e) => e.exit(),
         }
     }
 
     /// Parse from iterator, return Err on error.
-    fn try_parse_from<I, T>(&self, itr: I) -> Result<Box<Cli>, clap::Error>
+    pub fn try_parse_from<I, T>(&self, itr: I) -> Result<Box<Cli>, clap::Error>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
@@ -210,11 +214,8 @@ impl CliParserTrait for CliParser {
         Ok(Box::new(cli))
     }
 
-    fn fail_fast_flag(&self, cli: &Self::CliType) -> bool {
-        cli.common_args.fail_fast
-    }
-
-    fn warn_error_options(&self, cli: &Self::CliType) -> Option<WarnErrorOptions> {
+    /// Extract warn-error options from the parsed CLI.
+    pub fn warn_error_options(&self, cli: &Cli) -> Option<WarnErrorOptions> {
         Some(cli.common_args.get_cli_warn_error_options())
     }
 }
@@ -286,6 +287,7 @@ got {:?}, expected an instance of {}",
                 | Command::Core(Man(_))
                 | Command::Core(Init(_))
                 | Command::Core(Docs(_))
+                | Command::Core(Login(_))
                 | Command::Core(Completions(_)) => {
                     // These commands do not require a project directory
                     (PathBuf::from("."), PathBuf::from("."))
@@ -325,6 +327,7 @@ got {:?}, expected an instance of {}",
                 Debug(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
                 Retry(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
                 Docs(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
+                Login(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
                 Completions(args) => args.to_eval_args(system_arg, &in_dir, &out_dir),
             },
             Command::Extension(ext_cmd) => ext_cmd.to_eval_args(&common_args, system_arg)?,
@@ -332,6 +335,9 @@ got {:?}, expected an instance of {}",
         arg.from_main = from_main;
         if arg.local_execution_backend != LocalExecutionBackendKind::Remote {
             arg.static_analysis = Some(StaticAnalysisKind::Strict);
+        }
+        if arg.write_index && arg.static_analysis == Some(StaticAnalysisKind::Strict) {
+            arg.write_lineage = true;
         }
         Ok(arg)
     }
@@ -382,6 +388,7 @@ got {:?}, expected an instance of {}",
                 Debug(args) => args.common_args.phase.clone().unwrap_or(Phases::Debug),
                 Retry(args) => args.common_args.phase.clone().unwrap_or(Phases::All),
                 Docs(_args) => unreachable!("Docs command does not need a phase"),
+                Login(_args) => unreachable!("Login command does not need a phase"),
                 Completions(_args) => unreachable!("Completions command does not need a phase"),
             },
             Command::Extension(ext_cmd) => ext_cmd.stage(),
@@ -442,6 +449,20 @@ got {:?}, expected an instance of {}",
                 _ => vec![],
             },
             Command::Extension(ext_cmd) => ext_cmd.sampled(),
+        }
+    }
+
+    pub fn sample_select(&self) -> Option<Vec<String>> {
+        match &self.command {
+            Command::Core(_) => None,
+            Command::Extension(ext_cmd) => ext_cmd.sample_select(),
+        }
+    }
+
+    pub fn sample_exclude(&self) -> Option<Vec<String>> {
+        match &self.command {
+            Command::Core(_) => None,
+            Command::Extension(ext_cmd) => ext_cmd.sample_exclude(),
         }
     }
 }
@@ -629,10 +650,6 @@ pub struct SeedArgs {
     )]
     pub run_cache_mode: RunCacheMode,
 
-    /// Disable dbt State
-    #[arg(long, default_value = "false", conflicts_with = "force_node_selection")]
-    pub no_run_cache: bool,
-
     /// Flag to enable or disable SQL analysis, or to run SQL in unsafe mode, enabled by default
     #[arg(global = true, long, env = "DBT_STATIC_ANALYSIS")]
     pub static_analysis: Option<StaticAnalysisKind>,
@@ -649,7 +666,6 @@ impl SeedArgs {
         configure_run_cache(
             &mut eval_args,
             &self.common_args,
-            self.no_run_cache,
             self.force_node_selection,
             &self.run_cache_mode,
         );
@@ -806,10 +822,6 @@ pub struct SnapshotArgs {
     )]
     pub run_cache_mode: RunCacheMode,
 
-    /// Disable dbt State
-    #[arg(long, default_value = "false", conflicts_with = "force_node_selection")]
-    pub no_run_cache: bool,
-
     /// Flag to enable or disable SQL analysis, or to run SQL in unsafe mode, enabled by default
     #[arg(global = true, long, env = "DBT_STATIC_ANALYSIS")]
     pub static_analysis: Option<StaticAnalysisKind>,
@@ -822,7 +834,6 @@ impl SnapshotArgs {
         configure_run_cache(
             &mut eval_args,
             &self.common_args,
-            self.no_run_cache,
             self.force_node_selection,
             &self.run_cache_mode,
         );
@@ -858,10 +869,6 @@ pub struct TestArgs {
     )]
     pub run_cache_mode: RunCacheMode,
 
-    /// Disable dbt State
-    #[arg(long, default_value = "false", conflicts_with = "force_node_selection")]
-    pub no_run_cache: bool,
-
     /// Limiting number of shown rows. Run with --limit -1 to remove limit [default: 10]
     #[arg(long, default_value=DEFAULT_LIMIT, allow_hyphen_values = true)]
     pub limit: RowLimit,
@@ -890,7 +897,6 @@ impl TestArgs {
         configure_run_cache(
             &mut eval_args,
             &self.common_args,
-            self.no_run_cache,
             self.force_node_selection,
             &self.run_cache_mode,
         );
@@ -930,10 +936,6 @@ pub struct BuildArgs {
         conflicts_with = "force_node_selection"
     )]
     pub run_cache_mode: RunCacheMode,
-
-    /// Disable dbt State
-    #[arg(long, default_value = "false", conflicts_with = "force_node_selection")]
-    pub no_run_cache: bool,
 
     /// Drop incremental models and fully recalculate incremental tables.
     #[arg(global = true, long, action = ArgAction::SetTrue, value_parser = BoolishValueParser::new(), short = 'f', env = "DBT_FULL_REFRESH")]
@@ -991,7 +993,6 @@ impl BuildArgs {
         configure_run_cache(
             &mut eval_args,
             &self.common_args,
-            self.no_run_cache,
             self.force_node_selection,
             &self.run_cache_mode,
         );
@@ -1069,10 +1070,6 @@ pub struct RunArgs {
     )]
     pub run_cache_mode: RunCacheMode,
 
-    /// Disable dbt State
-    #[arg(long, default_value = "false", conflicts_with = "force_node_selection")]
-    pub no_run_cache: bool,
-
     /// Limiting number of shown rows. Run with --limit -1 to remove limit [default: 10]
     #[arg(long, default_value=DEFAULT_LIMIT, allow_hyphen_values = true)]
     pub limit: RowLimit,
@@ -1109,7 +1106,6 @@ impl RunArgs {
         configure_run_cache(
             &mut eval_args,
             &self.common_args,
-            self.no_run_cache,
             self.force_node_selection,
             &self.run_cache_mode,
         );
@@ -1144,17 +1140,17 @@ impl RunArgs {
 fn configure_run_cache(
     eval_args: &mut EvalArgs,
     common_args: &CommonArgs,
-    no_run_cache: bool,
     force_node_selection: bool,
     run_cache_mode: &RunCacheMode,
 ) {
-    if no_run_cache {
+    if common_args.no_manage_state {
         eval_args.run_cache_service = false;
         return;
     }
 
-    if common_args.task_cache_url != NOOP || common_args.run_cache_service {
-        eval_args.run_cache_service = common_args.run_cache_service;
+    let manage_state = common_args.get_manage_state(&eval_args.io.in_dir);
+    if common_args.task_cache_url != NOOP || manage_state {
+        eval_args.run_cache_service = manage_state;
         eval_args.run_cache_mode = if force_node_selection {
             RunCacheMode::WriteOnly
         } else {
@@ -1195,12 +1191,17 @@ impl CloneArgs {
 
 #[derive(Parser, Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RunOperationArgs {
-    #[arg(id = "MACRO")]
-    pub macro_name: String,
+    #[arg(id = "MACRO", conflicts_with = "sql", required_unless_present = "sql")]
+    pub macro_name: Option<String>,
 
     /// Supply arguments to the macro. This dictionary will be mapped to the keyword arguments defined in the selected macro. This argument should be a yml string.
-    #[arg(long,value_parser = check_key_value_cli_arg)]
+    #[arg(long, value_parser = check_key_value_cli_arg, conflicts_with = "sql")]
     pub args: Option<BTreeMap<String, YValue>>,
+
+    /// Execute an inline SQL/Jinja statement directly against the target database.
+    /// Mutually exclusive with the named-macro form and `--args`.
+    #[arg(long, conflicts_with_all = ["MACRO", "args"])]
+    pub sql: Option<String>,
 
     // Flattened IO args
     #[clap(flatten)]
@@ -1212,8 +1213,9 @@ impl RunOperationArgs {
         let mut eval_args = self.common_args.to_eval_args(arg, in_dir, out_dir);
         eval_args.phase = Phases::RunOperation;
         eval_args.macro_name = self.macro_name.clone();
-        if self.args.is_some() {
-            eval_args.macro_args = self.args.as_ref().unwrap().clone();
+        eval_args.macro_sql = self.sql.clone();
+        if let Some(args) = &self.args {
+            eval_args.macro_args = args.clone();
         }
 
         eval_args
@@ -1237,6 +1239,27 @@ pub struct ManArgs {
     pub pre_schema: Vec<ClapSchemaTypes>,
 }
 // dbt man --schema selector --schema project
+
+#[derive(Parser, Debug, Default, Clone, Serialize, Deserialize)]
+pub struct LoginArgs {
+    #[clap(flatten)]
+    pub common_args: CommonArgs,
+
+    #[command(subcommand)]
+    pub subcommand: Option<LoginSubcommand>,
+}
+
+impl LoginArgs {
+    pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
+        self.common_args.to_eval_args(arg, in_dir, out_dir)
+    }
+}
+
+#[derive(clap::Subcommand, Debug, Clone, Serialize, Deserialize)]
+pub enum LoginSubcommand {
+    /// Show current authentication status
+    Status,
+}
 
 impl ManArgs {
     pub fn to_eval_args(&self, arg: SystemArgs, in_dir: &Path, out_dir: &Path) -> EvalArgs {
@@ -1483,9 +1506,18 @@ pub struct CommonArgs {
     #[arg(global = true, long, default_value_t=false, action = ArgAction::SetTrue, env = "DBT_WRITE_METADATA", value_parser = BoolishValueParser::new())]
     pub write_metadata: bool,
 
+    /// Write parquet index to target/index/. Implies --write-metadata so that epoch parquet
+    /// is produced, then converts metadata → index parquet via the snapshot writer.
+    #[arg(global = true, long = "write-index", alias = "use-index", default_value_t=false, action = ArgAction::SetTrue, env = "DBT_USE_INDEX", value_parser = BoolishValueParser::new())]
+    pub write_index: bool,
+
     /// Directory for metadata parquet output (default: <target>/metadata/)
     #[arg(global = true, long, env = "DBT_METADATA_DIR")]
     pub metadata_dir: Option<PathBuf>,
+
+    /// Directory for index parquet output (default: <target>/index/)
+    #[arg(global = true, long, env = "DBT_INDEX_DIR")]
+    pub index_dir: Option<PathBuf>,
 
     /// Compute and write column-level lineage into compile/cll parquet.
     /// Requires --write-metadata and --static-analysis strict. Omitting this flag
@@ -1735,8 +1767,11 @@ pub struct CommonArgs {
     pub task_cache_url: String,
 
     /// Enable service-backed dbt State without legacy task-cache coordination
-    #[arg(global = true, long = "run-cache-service", default_value_t = false, action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
-    pub run_cache_service: bool,
+    #[arg(global = true, long = "manage-state", default_value_t = false, action = ArgAction::SetTrue, env = MANAGE_STATE_ENV, value_parser = BoolishValueParser::new())]
+    pub manage_state: bool,
+    /// Disable service-backed dbt State
+    #[arg(global = true, long = "no-manage-state", default_value_t = false, action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
+    pub no_manage_state: bool,
 
     // --------------------------------------------------------------------------------------------
     // internal only
@@ -1948,14 +1983,67 @@ fn resolve_show_arg(show_arg: &[ShowOptions], quiet: bool) -> HashSet<ShowOption
     show
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct FlagsFile {
+    #[serde(default)]
+    flags: Option<FlagsBlock>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FlagsBlock {
+    manage_state: Option<bool>,
+}
+
+fn manage_state_from_yaml(path: &Path) -> Option<bool> {
+    let content = stdfs::read_to_string(path).ok()?;
+    let file = dbt_yaml::from_str::<FlagsFile>(&content).ok()?;
+    file.flags.and_then(|flags| flags.manage_state)
+}
+
+fn user_settings_path() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(USER_SETTINGS_YML))
+}
+
 impl CommonArgs {
+    pub fn get_manage_state(&self, project_dir: &Path) -> bool {
+        self.get_manage_state_with(
+            project_dir,
+            env::var_os(MANAGE_STATE_ENV),
+            user_settings_path(),
+        )
+    }
+
+    fn get_manage_state_with(
+        &self,
+        project_dir: &Path,
+        manage_state_env: Option<OsString>,
+        user_settings_path: Option<PathBuf>,
+    ) -> bool {
+        if self.no_manage_state {
+            return false;
+        }
+        if self.manage_state {
+            return true;
+        }
+        if let Some(value) = manage_state_env {
+            return BoolishValueParser::new()
+                .parse_ref(&clap::Command::new("dbt-fusion"), None, value.as_ref())
+                .unwrap_or(self.manage_state);
+        }
+        manage_state_from_yaml(&project_dir.join(DBT_PROJECT_YML))
+            .or_else(|| user_settings_path.and_then(|path| manage_state_from_yaml(&path)))
+            .unwrap_or(false)
+    }
+
     pub fn get_warn_error(&self) -> Option<bool> {
         if self.warn_error {
             Some(true)
         } else if self.no_warn_error {
             Some(false)
         } else {
-            std::env::var_os("DBT_WARN_ERROR").and_then(|value| {
+            env::var_os("DBT_WARN_ERROR").and_then(|value| {
                 BoolishValueParser::new()
                     .parse_ref(&clap::Command::new("dbt-fusion"), None, OsStr::new(&value))
                     .ok()
@@ -1968,8 +2056,10 @@ impl CommonArgs {
     /// `--verify-partial-load` → `--partial-load` → `--partial-parse`
     /// `--verify-partial-parse` → `--partial-parse`
     /// `--dirty` → `--partial-parse`
+    /// `--write-index` → `--write-metadata` → `--partial-parse`
     pub fn effective_partial_parse(&self) -> bool {
         self.write_metadata
+            || self.write_index
             || self.partial_parse
             || self.partial_load
             || self.verify_partial_load
@@ -1978,8 +2068,9 @@ impl CommonArgs {
     }
 
     /// `--verify-partial-load` implies `--partial-load`. `--write-metadata` implies both.
+    /// `--write-index` implies `--write-metadata` implies both.
     pub fn effective_partial_load(&self) -> bool {
-        self.write_metadata || self.partial_load || self.verify_partial_load
+        self.write_metadata || self.write_index || self.partial_load || self.verify_partial_load
     }
 
     /// Resolve the effective value of `--quiet` / `--no-quiet`.
@@ -2079,8 +2170,9 @@ impl CommonArgs {
             state: self.state.clone(),
             defer_state: self.defer_state.clone(),
             connection: false,
-            macro_name: "".to_string(),
+            macro_name: None,
             macro_args: BTreeMap::new(),
+            macro_sql: None,
             selector: self.selector.clone(),
             resource_types: vec![],
             exclude_resource_types: vec![],
@@ -2118,13 +2210,15 @@ impl CommonArgs {
             project_dir: self.project_dir.clone(),
             quiet: self.get_quiet(),
             send_anonymous_usage_stats: self.get_send_anonymous_usage_stats(),
-            write_json: if self.write_metadata || self.no_write_json {
+            write_json: if (self.write_metadata && !self.write_index) || self.no_write_json {
                 false
             } else {
                 self.write_json
             },
-            write_catalog: self.write_catalog,
-            write_metadata: self.write_metadata,
+            write_catalog: self.write_catalog || self.write_index,
+            write_metadata: self.write_metadata || self.write_index,
+            write_index: self.write_index,
+            index_dir: self.index_dir.clone(),
             metadata_dir: self.metadata_dir.clone(),
             fail_fast: self.fail_fast,
             target_path: self.target_path.clone(),
@@ -2154,6 +2248,7 @@ impl CommonArgs {
             skip_post_hooks: false,
             skip_creating_generic_tests: false,
             write_lineage: self.write_lineage,
+            force_enable_linter: false,
         }
     }
 
@@ -2220,6 +2315,11 @@ pub struct SystemUpdateArgs {
     /// Package to update (e.g. dbt) [default: dbt]
     #[arg(long)]
     pub package: Option<String>,
+
+    /// Self-update in place even when dbt was installed by a package manager.
+    /// This overwrites the package-manager-owned binary.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize)]
@@ -2419,5 +2519,126 @@ pub fn from_lib(cli: &Cli) -> SystemArgs {
         target: common_args.target,
         num_threads: common_args.threads,
         no_parallel: common_args.no_parallel,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn get_manage_state_with_env(
+        common_args: &CommonArgs,
+        project_dir: &Path,
+        env_value: Option<&str>,
+        user_settings_path: Option<PathBuf>,
+    ) -> bool {
+        common_args.get_manage_state_with(
+            project_dir,
+            env_value.map(OsString::from),
+            user_settings_path,
+        )
+    }
+
+    #[test]
+    fn manage_state_defaults_to_false() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let common_args = CommonArgs::default();
+
+        assert!(!get_manage_state_with_env(
+            &common_args,
+            project_dir.path(),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn manage_state_reads_project_flags() {
+        let project_dir = tempfile::tempdir().unwrap();
+        stdfs::write(
+            project_dir.path().join(DBT_PROJECT_YML),
+            "flags:\n  manage_state: true\n",
+        )
+        .unwrap();
+        let common_args = CommonArgs::default();
+
+        assert!(get_manage_state_with_env(
+            &common_args,
+            project_dir.path(),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn manage_state_reads_user_settings() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        stdfs::create_dir_all(home_dir.path().join(".dbt")).unwrap();
+        let user_settings = home_dir.path().join(USER_SETTINGS_YML);
+        stdfs::write(&user_settings, "flags:\n  manage_state: true\n").unwrap();
+        let common_args = CommonArgs::default();
+
+        assert!(get_manage_state_with_env(
+            &common_args,
+            project_dir.path(),
+            None,
+            Some(user_settings)
+        ));
+    }
+
+    #[test]
+    fn manage_state_cli_overrides_env_false() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let common_args = CommonArgs {
+            manage_state: true,
+            ..Default::default()
+        };
+
+        assert!(get_manage_state_with_env(
+            &common_args,
+            project_dir.path(),
+            Some("false"),
+            None
+        ));
+    }
+
+    #[test]
+    fn no_manage_state_overrides_project_flags() {
+        let project_dir = tempfile::tempdir().unwrap();
+        stdfs::write(
+            project_dir.path().join(DBT_PROJECT_YML),
+            "flags:\n  manage_state: true\n",
+        )
+        .unwrap();
+        let common_args = CommonArgs {
+            no_manage_state: true,
+            ..Default::default()
+        };
+
+        assert!(!get_manage_state_with_env(
+            &common_args,
+            project_dir.path(),
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn env_false_overrides_project_flags() {
+        let project_dir = tempfile::tempdir().unwrap();
+        stdfs::write(
+            project_dir.path().join(DBT_PROJECT_YML),
+            "flags:\n  manage_state: true\n",
+        )
+        .unwrap();
+        let common_args = CommonArgs::default();
+
+        assert!(!get_manage_state_with_env(
+            &common_args,
+            project_dir.path(),
+            Some("false"),
+            None
+        ));
     }
 }

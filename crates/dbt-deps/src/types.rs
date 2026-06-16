@@ -12,7 +12,7 @@ use super::semver::{
     resolve_to_specific_version,
 };
 
-use super::hub_client::{DBT_CORE_FIXED_VERSION, HubClient};
+use super::hub_client::{DBT_CORE_FIXED_VERSION, HubClient, HubPackageJson, HubPackageVersion};
 
 /// Parse a version string that may be a single semver specifier or a
 /// stringified list produced by Jinja rendering (e.g. `['>=0.8.0', '<0.9.0']`).
@@ -69,14 +69,38 @@ pub struct HubUnpinnedPackage {
     pub package: String,
     pub versions: Vec<Version>, // Semver Versions
     pub install_prerelease: Option<bool>,
+    /// Set by [`crate::package_resolver::PackageResolver::resolve`]; reused for lock entries.
+    pub(crate) resolved_hub: Option<ResolvedHubPackage>,
+}
+
+/// Pinned hub package paired with the hub metadata used to pin it. Lets
+/// callers (notice recording, transitive resolution, v2-download substitution)
+/// reuse what [`HubUnpinnedPackage::resolved`] already had to fetch.
+#[derive(Clone, Debug)]
+pub struct ResolvedHubPackage {
+    pub pinned: HubPinnedPackage,
+    pub hub_package: HubPackageJson,
+    pub version: HubPackageVersion,
+}
+
+impl crate::notices::NoticeSource for ResolvedHubPackage {
+    fn record_into(&self, buffer: &crate::notices::NoticeBuffer) {
+        for n in self.hub_package.deprecation_notices() {
+            buffer.record(n);
+        }
+        if let Some(n) = self.version.version_compat_notice(&self.hub_package.name) {
+            buffer.record(n);
+        }
+    }
 }
 
 impl HubUnpinnedPackage {
     pub fn incorporate(&mut self, other: Self) {
         self.versions.extend(other.versions);
+        self.resolved_hub = None;
     }
 
-    pub async fn resolved(&self, hub_registry: &HubClient) -> FsResult<HubPinnedPackage> {
+    pub async fn resolved(&self, hub_registry: &HubClient) -> FsResult<ResolvedHubPackage> {
         if !hub_registry.check_index(&self.package).await? {
             return err!(
                 ErrorCode::InvalidConfig,
@@ -101,22 +125,29 @@ impl HubUnpinnedPackage {
                 self.package
             );
         }
-        let resolved_version = if let Some(resolved_version) =
-            resolve_to_specific_version(&version_range, &installable)?
-        {
-            resolved_version
-        } else {
+        let Some(resolved_version) = resolve_to_specific_version(&version_range, &installable)?
+        else {
             return err!(
                 ErrorCode::InvalidConfig,
                 "No compatible versions found for package '{}'",
                 self.package
             );
         };
-        Ok(HubPinnedPackage {
+        let version = hub_package
+            .versions
+            .get(&resolved_version)
+            .cloned()
+            .expect("resolved version should exist in package metadata");
+        let pinned = HubPinnedPackage {
             package: self.package.clone(),
-            name: hub_package.name,
+            name: hub_package.name.clone(),
             version: resolved_version,
             version_latest: installable.last().unwrap().clone(),
+        };
+        Ok(ResolvedHubPackage {
+            pinned,
+            hub_package,
+            version,
         })
     }
 }
@@ -147,6 +178,7 @@ impl TryFrom<HubPackage> for HubUnpinnedPackage {
             package: hub_package.package,
             versions: versions.into_iter().map(Version::Spec).collect(),
             install_prerelease: hub_package.install_prerelease,
+            resolved_hub: None,
         })
     }
 }

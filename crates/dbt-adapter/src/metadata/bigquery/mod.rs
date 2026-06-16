@@ -31,6 +31,18 @@ use std::sync::Arc;
 
 pub mod object_options;
 
+pub mod nested_projection;
+
+pub(crate) const BIGQUERY_PSEUDOCOLUMNS: [&str; 7] = [
+    "_PARTITIONTIME",
+    "_PARTITIONDATE",
+    "_FILE_NAME",
+    "_TABLE_SUFFIX",
+    "_CHANGE_TYPE",
+    "_CHANGE_TIMESTAMP",
+    "_CHANGE_SEQUENCE_NUMBER",
+];
+
 pub fn list_relations(
     engine: &dyn AdapterEngine,
     ctx: &QueryCtx,
@@ -62,18 +74,16 @@ FROM
         let relation_type =
             RelationType::from_adapter_type(AdapterType::Bigquery, table_types.value(i));
 
-        result.push(Arc::new(Relation::new(
-            AdapterType::Bigquery,
-            Some(database.to_string()),
-            Some(schema.to_string()),
-            Some(identifier.to_string()),
-            Some(relation_type),
-            None,
-            engine.quoting(),
-            None,
-            false,
-            false,
-        )) as Arc<dyn BaseRelation>);
+        result.push(Arc::new(
+            Relation::new(
+                AdapterType::Bigquery,
+                database.to_string(),
+                schema.to_string(),
+                identifier.to_string(),
+            )
+            .with_relation_type(relation_type)
+            .with_quoting(engine.quoting()),
+        ) as Arc<dyn BaseRelation>);
     }
     Ok(result)
 }
@@ -202,24 +212,32 @@ impl TrieNode {
 /// The implementation is purely based on the pydoc and the limited observations of how dbt
 /// compile behehaves on the test example so there probably exist corner cases not handled
 /// properly
-/// TODO: support constraints
+///
+/// When `constraints` is supplied (keyed by top-level column name), the rendered constraint
+/// clause is appended to the column's data type so that the resulting DDL emits e.g.
+/// `id INT64 NOT NULL`. BigQuery treats `NOT NULL` in the column spec as `mode: REQUIRED`.
 pub fn nest_column_data_types(
     columns: IndexMap<String, DbtColumn>,
-    _constraints: Option<BTreeMap<String, String>>,
+    constraints: Option<BTreeMap<String, String>>,
 ) -> AdapterResult<IndexMap<String, DbtColumn>> {
     let mut result = NestedColumnDataTypes::default();
     for (column_name, column) in &columns {
         result.insert(column_name, column.data_type.as_ref())
     }
     let column_to_data_type = result.format_top_level_columns_data_types();
+    let constraints = constraints.unwrap_or_default();
     let mut result = IndexMap::new();
     for (column_name, data_type) in &column_to_data_type {
+        let data_type_with_constraints = match constraints.get(column_name) {
+            Some(c) if !c.is_empty() => format!("{data_type} {c}"),
+            _ => data_type.clone(),
+        };
         match columns.get(column_name) {
             Some(column) => result.insert(
                 column_name.clone(),
                 DbtColumn {
                     name: column.name.clone(),
-                    data_type: Some(data_type.clone()),
+                    data_type: Some(data_type_with_constraints),
                     description: column.description.clone(),
                     constraints: column.constraints.clone(),
                     meta: column.meta.clone(),
@@ -229,13 +247,16 @@ pub fn nest_column_data_types(
                     column_mask: column.column_mask.clone(),
                     quote: column.quote,
                     deprecated_config: column.deprecated_config.clone(),
+                    dimension: column.dimension.clone(),
+                    entity: column.entity.clone(),
+                    granularity: column.granularity.clone(),
                 },
             ),
             None => result.insert(
                 column_name.clone(),
                 DbtColumn {
                     name: column_name.to_owned(),
-                    data_type: Some(data_type.to_owned()),
+                    data_type: Some(data_type_with_constraints),
                     description: None,
                     constraints: vec![],
                     meta: IndexMap::new(),
@@ -245,6 +266,9 @@ pub fn nest_column_data_types(
                     column_mask: None,
                     quote: None,
                     deprecated_config: Default::default(),
+                    dimension: None,
+                    entity: None,
+                    granularity: None,
                 },
             ),
         };
@@ -423,23 +447,26 @@ fn qualifier_options_for_info_schema_view(
     }
 }
 
-// Generate the fully qualified name of a BigQuery INFORMATION_SCHEMA table.
-//
-// BQ's info schema tables have unique way of handling qualifiers. Instead of a
-// "database", the qualifier is something like [<project_id>.]<region_or_dataset_id>.
-// but in some cases the region is also optional.
-//
-// See `qualifier_options_for_info_schema_view` for specific view requirements..
-//
-// TODO: We're currently ignoring any differences between the provided qualifier and
-//       the spericific requirements for the given view name since this is only used to
-//       fetch the view schema, so the specific location doesn't really matter.
-fn generate_system_table_fqn(
-    qualifier: &str,
-    table: &str,
+/// Generate the fully qualified name of a BigQuery INFORMATION_SCHEMA table.
+///
+/// BQ's info schema tables have unique way of handling qualifiers. Instead of a
+/// "database", the qualifier is something like [<project_id>.]<region_or_dataset_id>.
+/// but in some cases the region is also optional.
+///
+/// See `qualifier_options_for_info_schema_view` for specific view requirements.
+///
+/// NOTE: this function is lenient and will return invalid qualifiers if the specific
+/// requirements are not met. I.e it will return stuff that might break if ran on BigQuery.
+///
+/// TODO: We're currently ignoring any differences between the provided qualifier and
+///       the specific requirements for the given view name since this is only used to
+///       fetch the view schema, so the specific location doesn't really matter.
+pub(crate) fn generate_system_table_fqn(
+    dataset: &str,
+    view_name: &str,
     user_preferred_region: Option<&str>,
 ) -> String {
-    let sys_identifier = table.to_uppercase();
+    let sys_identifier = view_name.to_uppercase();
 
     match qualifier_options_for_info_schema_view(&sys_identifier) {
         Some(qualifier_option) => match qualifier_option.requirement {
@@ -448,13 +475,13 @@ fn generate_system_table_fqn(
                 format!("`region-{region}`.INFORMATION_SCHEMA.{sys_identifier}")
             }
             QualifierRequirement::DatasetOnly => {
-                format!("{qualifier}.INFORMATION_SCHEMA.{sys_identifier}")
+                format!("{dataset}.INFORMATION_SCHEMA.{sys_identifier}")
             }
             QualifierRequirement::DatasetOrRegion => {
                 // respect user's location preferences by querying the region directly if
                 // possible
                 match user_preferred_region {
-                    None => format!("{qualifier}.INFORMATION_SCHEMA.{sys_identifier}"),
+                    None => format!("{dataset}.INFORMATION_SCHEMA.{sys_identifier}"),
                     Some(region) => {
                         format!("`region-{region}`.INFORMATION_SCHEMA.{sys_identifier}")
                     }

@@ -460,7 +460,7 @@ mod tests {
     use std::{collections::BTreeSet, path::PathBuf, sync::Mutex};
 
     use dbt_adapter::Adapter;
-    use dbt_adapter::sql_types::SATypeOpsImpl;
+    use dbt_adapter::sql_types::DefaultTypeOps;
     use dbt_adapter_core::AdapterType;
     use dbt_schemas::schemas::relations::DEFAULT_DBT_QUOTING;
     use minijinja::{
@@ -596,7 +596,7 @@ all okay!");
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
-            Arc::new(SATypeOpsImpl::new(AdapterType::Postgres)),
+            Arc::new(DefaultTypeOps::new(AdapterType::Postgres)),
             None,
         );
         let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
@@ -683,7 +683,7 @@ all okay!");
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
-            Arc::new(SATypeOpsImpl::new(AdapterType::Postgres)),
+            Arc::new(DefaultTypeOps::new(AdapterType::Postgres)),
             None,
         );
         let builder: JinjaEnvBuilder = JinjaEnvBuilder::new()
@@ -745,7 +745,7 @@ all okay!");
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
-            Arc::new(SATypeOpsImpl::new(AdapterType::Postgres)),
+            Arc::new(DefaultTypeOps::new(AdapterType::Postgres)),
             None,
         );
         let env = JinjaEnvBuilder::new()
@@ -847,6 +847,34 @@ all okay!");
             rv.trim()
         );
     }
+
+    // from https://github.com/dbt-labs/scratch/tree/main/repros/fusion-789
+    #[test]
+    fn test_try_or_compiler_error_with_bound_method() {
+        let env = JinjaEnvBuilder::new().build();
+        let rv = env
+            .render_str(
+                "{%- set res = try_or_compiler_error('bad date', modules.datetime.datetime.strptime, '20240504', '%Y%m%d') -%}{{ res.strftime('%Y-%m-%d') }}",
+                context! {},
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rv.trim(), "2024-05-04");
+    }
+
+    #[test]
+    fn test_try_or_compiler_error_raises_on_failure() {
+        let env = JinjaEnvBuilder::new().build();
+        let err = env
+            .render_str(
+                "{%- set res = try_or_compiler_error('partition date mismatch', modules.datetime.datetime.strptime, 'not-a-date', '%Y-%m-%d') -%}{{ res }}",
+                context! {},
+                &[],
+            )
+            .unwrap_err();
+        assert_contains!(format!("{err}"), "partition date mismatch");
+    }
+
     #[test]
     fn test_root_package_in_non_internal_packages() {
         // Create macro units with macros only in other packages, not in root
@@ -865,7 +893,7 @@ all okay!");
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
-            Arc::new(SATypeOpsImpl::new(AdapterType::Postgres)),
+            Arc::new(DefaultTypeOps::new(AdapterType::Postgres)),
             None,
         );
 
@@ -916,7 +944,7 @@ all okay!");
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
-            Arc::new(SATypeOpsImpl::new(AdapterType::Postgres)),
+            Arc::new(DefaultTypeOps::new(AdapterType::Postgres)),
             None,
         );
 
@@ -961,7 +989,7 @@ all okay!");
             AdapterType::Postgres,
             dbt_yaml::Mapping::default(),
             DEFAULT_DBT_QUOTING,
-            Arc::new(SATypeOpsImpl::new(AdapterType::Postgres)),
+            Arc::new(DefaultTypeOps::new(AdapterType::Postgres)),
             None,
         );
 
@@ -985,5 +1013,82 @@ all okay!");
 
         let rv = env.render_str(template, context! {}, &[]).unwrap();
         assert_eq!(rv.trim(), "SHOULD_NOT_HAPPEN");
+    }
+
+    /// Regression test for the incremental-parse dispatch bug.
+    ///
+    /// On the incremental code path `drop_all_unchanged_nodes` removes external packages
+    /// (e.g. `dbt_utils`) from `dbt_state.packages` because none of their files changed.
+    /// If `THREAD_LOCAL_DEPENDENCIES` is populated from `dbt_state.packages` (the old code),
+    /// `dbt_utils` is absent and `adapter.dispatch('generate_surrogate_key', 'dbt_utils')`
+    /// returns `vec![None]` → dispatch searches globally without namespace → macro not found.
+    ///
+    /// The fix: derive the dependency set from `macros.macros.values().map(|m| m.package_name)`
+    /// — the macros are always fully populated (from cache) even when `dbt_state.packages` is
+    /// filtered, and package names are the correct namespace identifiers (not unique IDs).
+    #[test]
+    fn test_incremental_parse_dispatch_finds_external_package_macros() {
+        let mut macro_units = MacroUnitsWrapper::new(BTreeMap::new());
+        // External package macro (e.g. installed via packages.yml, files unchanged this run)
+        macro_units.macros.insert(
+            "dbt_utils".to_string(),
+            vec![create_macro_unit(
+                "default__generate_surrogate_key",
+                "{% macro default__generate_surrogate_key(field_list) %}surrogate_key_result{% endmacro %}",
+            )],
+        );
+        // Root package macro
+        macro_units.macros.insert(
+            "my_project".to_string(),
+            vec![create_macro_unit(
+                "my_macro",
+                "{% macro my_macro() %}root{% endmacro %}",
+            )],
+        );
+
+        let adapter = Adapter::new_parse_phase_adapter(
+            AdapterType::Postgres,
+            dbt_yaml::Mapping::default(),
+            DEFAULT_DBT_QUOTING,
+            Arc::new(DefaultTypeOps::new(AdapterType::Postgres)),
+            None,
+        );
+
+        let build_env = |pkgs: &[&str]| {
+            set_thread_local_dependencies(pkgs.iter().map(|s| (*s).to_string()));
+            JinjaEnvBuilder::new()
+                .with_adapter(Arc::new(adapter.clone()) as Arc<Adapter>)
+                .with_root_package("my_project".to_string())
+                .try_with_macros(macro_units.clone())
+                .expect("Failed to register macros")
+                .build()
+        };
+
+        // BUG: THREAD_LOCAL_DEPENDENCIES only contains the root package (incremental parse
+        // filtered dbt_utils out of dbt_state.packages). Dispatch to dbt_utils namespace
+        // falls back to vec![None] and fails to find the macro.
+        let env_broken = build_env(&["my_project"]);
+        let result = env_broken.render_str(
+            "{{ adapter.dispatch('generate_surrogate_key', 'dbt_utils')(['id']) }}",
+            context! {},
+            &[],
+        );
+        assert!(
+            result.is_err(),
+            "Expected dispatch to fail when dbt_utils is absent from THREAD_LOCAL_DEPENDENCIES"
+        );
+
+        // FIX: THREAD_LOCAL_DEPENDENCIES is derived from macros.macros.values().map(package_name),
+        // which always includes all packages whose macros are registered — regardless of whether
+        // their files were in the delta parse. Dispatch now resolves correctly.
+        let env_fixed = build_env(&["my_project", "dbt_utils"]);
+        let rv = env_fixed
+            .render_str(
+                "{{ adapter.dispatch('generate_surrogate_key', 'dbt_utils')(['id']) }}",
+                context! {},
+                &[],
+            )
+            .expect("Dispatch should succeed when dbt_utils is in THREAD_LOCAL_DEPENDENCIES");
+        assert_eq!(rv.trim(), "surrogate_key_result");
     }
 }
